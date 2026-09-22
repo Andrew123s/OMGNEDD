@@ -127,7 +127,7 @@ cmake --build build --target OMGNEDD_Bench
 ```
 
 On Windows the executables are under
-`build\OMGNEDD_Tests_artefacts\Release\OMGNEDD Tests.exe`.
+`build\OMGNEDD_Tests_artefacts\Release\OMGNEDD_Tests.exe`.
 
 On a headless Linux machine the verification target needs a display, because it
 builds and paints the real editor:
