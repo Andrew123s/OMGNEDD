@@ -1,0 +1,21 @@
+# JUCE is a sibling checkout, not part of this repository
+/JUCE/
+
+# build output
+/build/
+/build-*/
+*.vst3/
+cmake-build-*/
+
+# verification artefacts
+omgnedd-ui.png
+omgnedd-ui-small.png
+omgnedd-advanced.png
+
+# editors and platforms
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
