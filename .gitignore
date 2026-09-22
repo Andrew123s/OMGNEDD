@@ -11,6 +11,8 @@ cmake-build-*/
 omgnedd-ui.png
 omgnedd-ui-small.png
 omgnedd-advanced.png
+omgnedd-fx.png
+omgnedd-space.png
 
 # editors and platforms
 .vs/

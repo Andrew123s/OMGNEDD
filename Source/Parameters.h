@@ -139,6 +139,44 @@ namespace omg
         inline constexpr const char* mbCrossLow    = "mbCrossLow";
         inline constexpr const char* mbCrossHigh   = "mbCrossHigh";
 
+        // ---- filter fx --------------------------------------------------------------
+        inline constexpr const char* fxOn          = "fxOn";
+        inline constexpr const char* fxMode        = "fxMode";
+        inline constexpr const char* fxSync        = "fxSync";
+        inline constexpr const char* fxDiv         = "fxDiv";
+        inline constexpr const char* fxRate        = "fxRate";
+        inline constexpr const char* fxFreq        = "fxFreq";
+        inline constexpr const char* fxDepth       = "fxDepth";
+        inline constexpr const char* fxReso        = "fxReso";
+        inline constexpr const char* fxSens        = "fxSens";
+        inline constexpr const char* fxShape       = "fxShape";
+        inline constexpr const char* fxDrive       = "fxDrive";
+        inline constexpr const char* fxStereo      = "fxStereo";
+        inline constexpr const char* fxMix         = "fxMix";
+
+        // ---- pitch layer -------------------------------------------------------------
+        inline constexpr const char* pitShift      = "pitShift";
+        inline constexpr const char* pitMix        = "pitMix";
+
+        // ---- space ---------------------------------------------------------------------
+        inline constexpr const char* revOn         = "revOn";
+        inline constexpr const char* revMix        = "revMix";
+        inline constexpr const char* revSize       = "revSize";
+        inline constexpr const char* revDecay      = "revDecay";
+        inline constexpr const char* revDamp       = "revDamp";
+        inline constexpr const char* revPre        = "revPre";
+        inline constexpr const char* revDuck       = "revDuck";
+        inline constexpr const char* dlyOn         = "dlyOn";
+        inline constexpr const char* dlyMix        = "dlyMix";
+        inline constexpr const char* dlySync       = "dlySync";
+        inline constexpr const char* dlyDiv        = "dlyDiv";
+        inline constexpr const char* dlyTime       = "dlyTime";
+        inline constexpr const char* dlyFeedback   = "dlyFeedback";
+        inline constexpr const char* dlyTone       = "dlyTone";
+        inline constexpr const char* dlyPing       = "dlyPing";
+        inline constexpr const char* dlyDuck       = "dlyDuck";
+        inline constexpr const char* dlyWarp       = "dlyWarp";
+
         // ---- dry / wet levels ----------------------------------------------------
         inline constexpr const char* dryLevel      = "dryLevel";
         inline constexpr const char* wetLevel      = "wetLevel";

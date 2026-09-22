@@ -11,6 +11,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "UI/OmgKnob.h"
+#include "SoundTests.h"
 
 namespace
 {
@@ -196,8 +197,14 @@ namespace
     }
 }
 
-int main()
+int main (int argc, char** argv)
 {
+    // --quick skips the full knob sweep, which renders every parameter twice;
+    // --report prints the measured figure for every parameter in the sweep
+    juce::StringArray args;
+    for (int i = 1; i < argc; ++i) args.add (argv[i]);
+    const bool quick = args.contains ("--quick");
+    const bool report = args.contains ("--report");
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     StdoutLogger logger;
@@ -301,7 +308,7 @@ int main()
 
     // every distortion algorithm and saturation model
     setParam (omg::pid::engine, 1.0f);
-    for (int algo = 0; algo < 8; ++algo)
+    for (int algo = 0; algo < 11; ++algo)
     {
         setParam (omg::pid::dsType, (float) algo);
         bool finite = true;
@@ -310,7 +317,7 @@ int main()
     }
 
     setParam (omg::pid::engine, 2.0f);
-    for (int model = 0; model < 5; ++model)
+    for (int model = 0; model < 6; ++model)
     {
         setParam (omg::pid::satModel, (float) model);
         bool finite = true;
@@ -344,18 +351,28 @@ int main()
     for (int n = 0; n < 16; ++n) { fillNoise (buffer, random); processor.processBlock (buffer, midi); }
     check (processor.getCompressorReductionDb() > 0.5f, "the compressor reports real gain reduction");
 
-    // bypass passes audio through untouched
-    setParam (omg::pid::power, 0.0f);
-    fillNoise (buffer, random);
-    juce::AudioBuffer<float> copy (2, block);
-    for (int c = 0; c < 2; ++c) copy.copyFrom (c, 0, buffer, c, 0, block);
-    processor.processBlock (buffer, midi);
-    float maxDiff = 0.0f;
-    for (int c = 0; c < 2; ++c)
-        for (int i = 0; i < block; ++i)
-            maxDiff = juce::jmax (maxDiff, std::abs (buffer.getSample (c, i) - copy.getSample (c, i)));
-    check (maxDiff < 1.0e-6f, "POWER off passes the signal through untouched");
-    setParam (omg::pid::power, 1.0f);
+    // POWER off passes the audio through untouched, delayed by exactly the
+    // latency the plugin reports, so bypassing never shifts the vocal in time
+    {
+        setParam (omg::pid::power, 0.0f);
+        const int latency = processor.getLatencySamples();
+        std::vector<float> in, out;
+        juce::AudioBuffer<float> b (2, block);
+        for (int n = 0; n < 12; ++n)
+        {
+            fillNoise (buffer, random);
+            for (int c = 0; c < 2; ++c) b.copyFrom (c, 0, buffer, c, 0, block);
+            for (int i = 0; i < block; ++i) in.push_back (buffer.getSample (0, i));
+            processor.processBlock (buffer, midi);
+            for (int i = 0; i < block; ++i) out.push_back (buffer.getSample (0, i));
+        }
+        float maxDiff = 0.0f;
+        for (size_t i = (size_t) latency + (size_t) block * 2; i < out.size(); ++i)
+            maxDiff = juce::jmax (maxDiff, std::abs (out[i] - in[i - (size_t) latency]));
+        check (latency >= 0 && maxDiff < 1.0e-6f, "POWER off passes the signal through untouched, delayed by the reported "
+                                                   + juce::String (latency) + " samples of latency");
+        setParam (omg::pid::power, 1.0f);
+    }
 
     // ---- the new modules ------------------------------------------------
     juce::Logger::writeToLog ("\nModulation, multiband and transient");
@@ -702,9 +719,23 @@ int main()
 
         check (allUsable, "every factory preset stays finite and inside the ceiling"
                         + (worstPreset.isEmpty() ? juce::String() : " (failed on " + worstPreset + ")"));
-        check (processor.presetManager.getNumPresets() >= 32, "the factory bank covers all three engines and the hybrids");
+        check (processor.presetManager.getNumPresets() >= 48, "the factory bank covers every engine, the underground set, wobble and wah, and the hybrids ("
+                                                             + juce::String (processor.presetManager.getNumPresets()) + " presets)");
         processor.presetManager.load (0);
     }
+
+    // ---- the sound itself ----------------------------------------------------
+    {
+        auto checkFn = [] (bool ok, const juce::String& what) { check (ok, what); };
+        soundtests::invariance (checkFn);
+        soundtests::timing (checkFn);
+        soundtests::specifics (checkFn);
+        if (quick) juce::Logger::writeToLog ("\n  (--quick: the full knob sweep was skipped)");
+        else       soundtests::sensitivity (checkFn, report);
+    }
+
+    processor.setPlayConfigDetails (2, 2, sr, block);
+    processor.prepareToPlay (sr, block);
 
     // ---- state -------------------------------------------------------------
     juce::Logger::writeToLog ("\nState");
@@ -753,6 +784,27 @@ int main()
                    "the panel at " + juce::String (s[0]) + " x " + juce::String (s[1])
                      + " draws real content, not a flat fill (" + juce::String (colours) + " distinct colours)");
         }
+
+        // every page of the lower rack paints real content
+        editor->setSize (1200, 720);
+        for (const char* tab : { "tabFX", "tabSPACE", "tabTONE" })
+        {
+            if (auto* b = findByID (*editor, tab))
+            {
+                if (b->onClick != nullptr) b->onClick();
+                const auto image = renderComponent (*editor);
+                check (paintedCoverage (image) > 0.9f && distinctColours (image) >= 24,
+                       juce::String ("the ") + juce::String (tab).substring (3) + " page of the rack paints");
+                if (juce::String (tab) != "tabTONE")
+                    writePng (image, juce::String ("omgnedd-") + juce::String (tab).substring (3).toLowerCase() + ".png");
+            }
+            else
+            {
+                check (false, juce::String ("the rack tab ") + tab + " exists");
+            }
+        }
+
+        soundtests::knobInteraction (*editor, processor, [] (bool ok, const juce::String& what) { check (ok, what); });
 
         // render the panel to a file so the layout can be inspected
         editor->setSize (1200, 720);

@@ -22,6 +22,9 @@ namespace omg::ui
 
         /** Total footprint including the label and readout. */
         static juce::Rectangle<int> preferredBounds (Size size);
+
+        /** The parameter this knob drives. */
+        const juce::String& getParameterID() const noexcept { return paramID; }
         static int nominalDiameter (Size size);
         static int labelBlockFor (Size size);
         int getDialDiameter() const;

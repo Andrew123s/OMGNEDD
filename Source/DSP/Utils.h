@@ -82,7 +82,7 @@ namespace omg::dsp
 
         double sampleRate { 44100.0 }, phase { 0.0 }, inc { 0.0 }, offset { 0.0 };
         float held { 0.0f };
-        juce::Random random;
+        juce::Random random { 0x10F0 };
     };
 
     /** Peak, RMS and clip state handed from the audio thread to the editor. */

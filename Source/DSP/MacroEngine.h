@@ -8,125 +8,160 @@
 #include "OutputStage.h"
 #include "ModulationEngine.h"
 #include "TransientShaper.h"
+#include "SpaceEngine.h"
 
 namespace omg::dsp
 {
     /** CHARACTER and the six vocal macros.
 
-        None of these are parameters of their own in the DSP; they are offsets
-        applied on top of the per-engine controls every block, so a user can move
-        one macro and see several real parameters move with it.
+        None of these are DSP parameters of their own. Every block they are
+        applied on top of the values read from the panel, so moving one macro
+        moves several real parameters at once.
+
+        How they combine matters more than it looks. The first version added
+        an offset and clamped the result, so a DEPTH knob at 70 with a +35
+        macro offset sat at the ceiling: turning the knob from 70 to 100 did
+        nothing at all. Offsets now *push* proportionally towards the end of
+        the range instead, which keeps the panel knob live over its whole
+        travel whatever the macros are doing:
+
+            push (v, +a) = v + (hi - v) * a       push (v, -a) = v - (v - lo) * a
+
+        CHARACTER is centred: at 50 it leaves the panel alone. The other macros
+        are neutral at their defaults (BODY and COLOR at 50, the rest at 0), so
+        a fresh instance does exactly what its panel says.
     */
     struct MacroEngine
     {
         float character = 50.0f;
-        float body = 50, color = 50, damage = 0, depth = 30, motion = 20, space = 25;
+        float body = 50, color = 50, damage = 0, depth = 0, motion = 0, space = 0;
         bool  punch = false, chaos = false, air = false;
 
-        // CHARACTER is centred: 50 % leaves the panel settings alone.
-        float chr() const { return (character - 50.0f) / 50.0f; }      // -1 .. +1
+        float chr() const   { return (character - 50.0f) / 50.0f; }      // -1 .. +1
         float chrUp() const { return juce::jmax (0.0f, chr()); }
+        float tilt() const  { return (color - 50.0f) / 50.0f; }          // -1 dark .. +1 bright
+        float weight() const { return (body - 50.0f) / 50.0f; }          // -1 thin .. +1 heavy
 
-        static float add (float v, float amount, float lo, float hi)
+        /** Proportional push; @p amount in the parameter's own units. */
+        static float push (float v, float amount, float lo, float hi)
         {
-            return juce::jlimit (lo, hi, v + amount);
+            const float a = juce::jlimit (-1.0f, 1.0f, amount / (hi - lo));
+            return juce::jlimit (lo, hi, a >= 0.0f ? v + (hi - v) * a : v + (v - lo) * a);
         }
 
         void applyUnderwater (UnderwaterEngine::Params& u) const
         {
             const float c = chr();
-            u.depth    = add (u.depth,    c * 42.0f + pct (depth) * 30.0f, 0.0f, 100.0f);
-            u.water    = add (u.water,    c * 38.0f + pct (depth) * 20.0f, 0.0f, 100.0f);
-            u.murk     = add (u.murk,     c * 30.0f - bipolar (color - 50.0f) * 40.0f, 0.0f, 100.0f);
-            u.pressure = add (u.pressure, c * 26.0f + pct (body) * 16.0f - 8.0f, 0.0f, 100.0f);
-            u.ripple   = add (u.ripple,   c * 18.0f + pct (motion) * 45.0f, 0.0f, 100.0f);
-            u.wave     = add (u.wave,     c * 16.0f + pct (motion) * 40.0f, 0.0f, 100.0f);
-            u.bubble   = add (u.bubble,   c * 20.0f + pct (space) * 25.0f, 0.0f, 100.0f);
+            u.depth    = push (u.depth,    c * 40.0f + pct (depth) * 30.0f, 0.0f, 100.0f);
+            u.water    = push (u.water,    c * 35.0f + pct (depth) * 25.0f + pct (space) * 20.0f, 0.0f, 100.0f);
+            u.murk     = push (u.murk,     c * 25.0f - tilt() * 45.0f, 0.0f, 100.0f);
+            u.pressure = push (u.pressure, c * 25.0f + weight() * 30.0f + pct (damage) * 25.0f, 0.0f, 100.0f);
+            u.ripple   = push (u.ripple,   c * 20.0f + pct (motion) * 55.0f, 0.0f, 100.0f);
+            u.wave     = push (u.wave,     c * 15.0f + pct (motion) * 45.0f, 0.0f, 100.0f);
+            u.bubble   = push (u.bubble,   c * 20.0f + pct (motion) * 25.0f, 0.0f, 100.0f);
+            u.grit     = pct (damage);
             u.chaos    = chaos;
         }
 
         void applyDistortion (DistortionEngine::Params& d) const
         {
             const float c = chr();
-            d.drive  = add (d.drive,  c * 45.0f + pct (damage) * 55.0f, 0.0f, 100.0f);
-            d.bite   = add (d.bite,   c * 25.0f + bipolar (color - 50.0f) * 35.0f, 0.0f, 100.0f);
-            d.body   = add (d.body,   pct (body) * 40.0f - 20.0f, 0.0f, 100.0f);
-            d.crush  = add (d.crush,  pct (damage) * 45.0f + chrUp() * 15.0f, 0.0f, 100.0f);
-            d.edge   = add (d.edge,   c * 30.0f + pct (damage) * 25.0f, 0.0f, 100.0f);
-            d.smooth = add (d.smooth, -bipolar (color - 50.0f) * 30.0f, 0.0f, 100.0f);
+            d.drive  = push (d.drive,  c * 45.0f + pct (damage) * 55.0f, 0.0f, 100.0f);
+            d.bite   = push (d.bite,   c * 25.0f + tilt() * 40.0f, 0.0f, 100.0f);
+            d.body   = push (d.body,   weight() * 45.0f, 0.0f, 100.0f);
+            d.crush  = push (d.crush,  pct (damage) * 50.0f + chrUp() * 15.0f, 0.0f, 100.0f);
+            d.edge   = push (d.edge,   c * 30.0f + pct (damage) * 30.0f, 0.0f, 100.0f);
+            d.smooth = push (d.smooth, -tilt() * 35.0f, 0.0f, 100.0f);
             d.chaos  = chaos;
         }
 
         void applySaturation (SaturationEngine::Params& s) const
         {
             const float c = chr();
-            s.drive     = add (s.drive,     c * 42.0f + pct (damage) * 40.0f, 0.0f, 100.0f);
-            s.warmth    = add (s.warmth,    pct (body) * 35.0f - 17.0f, 0.0f, 100.0f);
-            s.harmonics = add (s.harmonics, c * 28.0f + pct (damage) * 35.0f, 0.0f, 100.0f);
-            s.thickness = add (s.thickness, pct (body) * 40.0f - 20.0f, 0.0f, 100.0f);
-            s.tone      = add (s.tone,      bipolar (color - 50.0f) * 70.0f, -100.0f, 100.0f);
-            s.density   = add (s.density,   c * 22.0f + pct (body) * 20.0f, 0.0f, 100.0f);
+            s.drive     = push (s.drive,     c * 42.0f + pct (damage) * 45.0f, 0.0f, 100.0f);
+            s.warmth    = push (s.warmth,    weight() * 35.0f - tilt() * 20.0f, 0.0f, 100.0f);
+            s.harmonics = push (s.harmonics, c * 28.0f + pct (damage) * 40.0f, 0.0f, 100.0f);
+            s.thickness = push (s.thickness, weight() * 45.0f, 0.0f, 100.0f);
+            s.tone      = push (s.tone,      tilt() * 80.0f, -100.0f, 100.0f);
+            s.density   = push (s.density,   c * 22.0f + weight() * 25.0f, 0.0f, 100.0f);
             s.chaos     = chaos;
         }
 
         void applyCompressor (CompressorSection::Params& comp) const
         {
-            comp.threshold = juce::jlimit (-60.0f, 0.0f, comp.threshold - pct (body) * 8.0f - chrUp() * 5.0f);
-            comp.ratio     = juce::jlimit (1.0f, 20.0f, comp.ratio + pct (damage) * 4.0f);
+            comp.threshold = juce::jlimit (-60.0f, 0.0f, comp.threshold - juce::jmax (0.0f, weight()) * 8.0f - chrUp() * 5.0f);
+            comp.ratio     = push (comp.ratio, pct (damage) * 6.0f, 1.0f, 20.0f);
             comp.punch     = punch;
         }
 
         void applyEq (std::array<EqSection::Band, kNumEqBands>& bands) const
         {
-            const float tilt = bipolar (color - 50.0f);       // -1 dark .. +1 bright
-            const float weight = pct (body) - 0.5f;
-
-            bands[1].gain = juce::jlimit (-24.0f, 24.0f, bands[1].gain + weight * 5.0f);   // LOW
-            bands[2].gain = juce::jlimit (-24.0f, 24.0f, bands[2].gain - weight * 2.5f);   // LOW MID
-            bands[5].gain = juce::jlimit (-24.0f, 24.0f, bands[5].gain + tilt * 5.0f);     // HIGH
-
-            if (air)
-                bands[5].gain = juce::jlimit (-24.0f, 24.0f, bands[5].gain + 2.0f);
+            bands[1].gain = juce::jlimit (-24.0f, 24.0f, bands[1].gain + weight() * 6.0f);     // LOW
+            bands[2].gain = juce::jlimit (-24.0f, 24.0f, bands[2].gain - weight() * 3.0f);     // LOW MID
+            bands[5].gain = juce::jlimit (-24.0f, 24.0f, bands[5].gain + tilt() * 7.0f
+                                                                        - pct (depth) * 5.0f   // distance darkens
+                                                                        + (air ? 2.5f : 0.0f));
         }
 
-        /** MOTION is the macro that owns the modulation section: it turns it on
-            once it is past a whisper, and takes the depth, the width and the
-            blend with it. The panel's own MOD controls stay the floor. */
+        void applyTransient (TransientShaper::Params& t) const
+        {
+            if (punch)
+            {
+                t.enabled = true;
+                t.attack = juce::jlimit (-100.0f, 100.0f, t.attack + 35.0f);
+            }
+
+            if (std::abs (weight()) > 0.04f)
+            {
+                t.enabled = true;
+                t.body = juce::jlimit (-100.0f, 100.0f, t.body + weight() * 40.0f);
+            }
+        }
+
         void applyModulation (ModulationEngine::Params& m) const
         {
             const float mo = pct (motion);
             if (mo > 0.02f)
                 m.enabled = true;
 
-            m.depth  = add (m.depth,  mo * 35.0f, 0.0f, 100.0f);
-            m.rate   = add (m.rate,   mo * 20.0f, 0.0f, 100.0f);
-            m.width  = add (m.width,  pct (space) * 30.0f, 0.0f, 100.0f);
-            m.motion = add (m.motion, mo * 40.0f, 0.0f, 100.0f);
-            m.mix    = add (m.mix,    mo * 25.0f + chrUp() * 8.0f, 0.0f, 100.0f);
+            m.depth  = push (m.depth,  mo * 45.0f, 0.0f, 100.0f);
+            m.rate   = push (m.rate,   mo * 20.0f, 0.0f, 100.0f);
+            m.width  = push (m.width,  pct (space) * 40.0f, 0.0f, 100.0f);
+            m.motion = push (m.motion, mo * 55.0f, 0.0f, 100.0f);
+            if (mo > 0.02f)
+                m.mix = push (m.mix, mo * 35.0f + chrUp() * 10.0f, 0.0f, 100.0f);
             m.chaos  = chaos;
         }
 
-        /** PUNCH and BODY both reach the transient shaper: PUNCH sharpens the
-            front of the word, BODY fills what follows it. */
-        void applyTransient (TransientShaper::Params& t) const
+        /** SPACE opens a room around the vocal; DEPTH pushes it further back,
+            with a longer pre-delay, a darker tail and more of it. Both leave a
+            reverb the user has set up on the SPACE page in charge of its own
+            size and decay, and only add to its level. */
+        void applySpace (SpaceEngine::Params& sp) const
         {
-            if (punch)
+            const float s = pct (space), dp = pct (depth);
+            const float amount = juce::jmax (s, dp);
+            if (amount < 0.005f) return;
+
+            if (! sp.revOn)
             {
-                t.enabled = true;
-                t.attack = juce::jlimit (-100.0f, 100.0f, t.attack + 30.0f);
+                sp.revOn = true;
+                sp.revMix = 0.0f;
+                sp.revSize = 40.0f + s * 30.0f + dp * 25.0f;
+                sp.revDecay = 1.1f + s * 1.6f + dp * 2.4f;
+                sp.revDamp = 40.0f + dp * 45.0f;
+                sp.revPre = 12.0f + dp * 50.0f;
+                sp.revDuck = 35.0f;
             }
 
-            const float weight = pct (body) - 0.5f;
-            if (std::abs (weight) > 0.04f)
-            {
-                t.enabled = true;
-                t.body = juce::jlimit (-100.0f, 100.0f, t.body + weight * 40.0f);
-            }
+            sp.revMix = push (sp.revMix, s * 32.0f + dp * 28.0f, 0.0f, 100.0f);
+            if (sp.dlyOn)
+                sp.dlyMix = push (sp.dlyMix, s * 12.0f, 0.0f, 100.0f);
         }
 
         void applyOutput (OutputStage::Params& o) const
         {
-            o.width = juce::jlimit (0.0f, 200.0f, o.width + pct (space) * 45.0f);
+            o.width = juce::jlimit (0.0f, 200.0f, o.width + pct (space) * 55.0f);
             o.air   = air;
         }
     };

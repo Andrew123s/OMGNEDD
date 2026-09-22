@@ -31,17 +31,17 @@ namespace omg
     class Randomizer
     {
     public:
-        enum Module { ModEngine = 0, ModEq, ModDynamics, ModModulation, ModMacros, ModOutput, NumModules };
+        enum Module { ModEngine = 0, ModEq, ModDynamics, ModModulation, ModMacros, ModOutput, ModFx, ModSpace, NumModules };
 
         static const char* moduleName (int m)
         {
-            static const char* names[] = { "ENGINE", "EQ", "DYNAMICS", "MOD", "MACROS", "OUTPUT" };
+            static const char* names[] = { "ENGINE", "EQ", "DYNAMICS", "MOD", "MACROS", "OUTPUT", "FILTER FX", "SPACE" };
             return names[juce::jlimit (0, NumModules - 1, m)];
         }
 
         static const char* lockPropertyName (int m)
         {
-            static const char* props[] = { "lockEngine", "lockEq", "lockDynamics", "lockMod", "lockMacros", "lockOutput" };
+            static const char* props[] = { "lockEngine", "lockEq", "lockDynamics", "lockMod", "lockMacros", "lockOutput", "lockFx", "lockSpace" };
             return props[juce::jlimit (0, NumModules - 1, m)];
         }
 
@@ -83,6 +83,8 @@ namespace omg
             if (! isLocked (ModModulation)) randomiseModulation (engine, attitude);
             if (! isLocked (ModMacros))     randomiseMacros (engine, attitude);
             if (! isLocked (ModOutput))     randomiseOutput (attitude);
+            if (! isLocked (ModFx))         randomiseFx (engine, attitude);
+            if (! isLocked (ModSpace))      randomiseSpace (engine, attitude);
 
             return attitude;
         }
@@ -208,6 +210,12 @@ namespace omg
                                                       : random.nextFloat() < 0.45f;
             set (pid::modOn, wantMod ? 1.0f : 0.0f);
 
+            // the pitch layer: an octave down under an underwater vocal is the
+            // one pairing that is almost always worth hearing
+            const bool layer = random.nextFloat() < (engine == Underwater ? 0.35f : 0.12f);
+            set (pid::pitShift, layer ? (random.nextFloat() < 0.75f ? -12.0f : uni (3.0f, 7.0f)) : 0.0f);
+            set (pid::pitMix, layer ? uni (15.0f, 40.0f) : 0.0f);
+
             if (! wantMod) return;
 
             const int mode = engine == Underwater
@@ -230,14 +238,68 @@ namespace omg
             set (pid::macColor,  juce::jlimit (0.0f, 100.0f, 50.0f + uni (-28.0f, 28.0f)));
             set (pid::macDamage, engine == Distortion ? juce::jlimit (0.0f, 100.0f, a * uni (25.0f, 70.0f))
                                                       : juce::jlimit (0.0f, 100.0f, a * uni (0.0f, 35.0f)));
-            set (pid::macDepth,  engine == Underwater ? juce::jlimit (0.0f, 100.0f, 25.0f + a * 55.0f)
-                                                      : juce::jlimit (0.0f, 100.0f, uni (0.0f, 35.0f)));
-            set (pid::macMotion, juce::jlimit (0.0f, 100.0f, uni (5.0f, 35.0f) + a * 30.0f));
-            set (pid::macSpace,  juce::jlimit (0.0f, 100.0f, uni (10.0f, 40.0f) + a * 25.0f));
+            set (pid::macDepth,  engine == Underwater ? juce::jlimit (0.0f, 100.0f, a * uni (10.0f, 45.0f))
+                                                      : juce::jlimit (0.0f, 100.0f, uni (0.0f, 25.0f)));
+            set (pid::macMotion, juce::jlimit (0.0f, 100.0f, uni (0.0f, 30.0f) * a));
+            set (pid::macSpace,  juce::jlimit (0.0f, 100.0f, uni (0.0f, 35.0f)));
 
             set (pid::sigPunch, random.nextFloat() < 0.35f ? 1.0f : 0.0f);
             set (pid::sigChaos, random.nextFloat() < (0.15f + a * 0.35f) ? 1.0f : 0.0f);
             set (pid::sigAir,   random.nextFloat() < 0.40f ? 1.0f : 0.0f);
+        }
+
+        void randomiseFx (int engine, float a)
+        {
+            // the moving filters are a statement: on in about a third of draws
+            const bool want = random.nextFloat() < 0.30f + (engine == Underwater ? 0.05f : 0.0f);
+            set (pid::fxOn, want ? 1.0f : 0.0f);
+            if (! want) return;
+
+            const int mode = random.nextInt (5);
+            set (pid::fxMode, (float) mode);
+            set (pid::fxSync, random.nextFloat() < 0.8f ? 1.0f : 0.0f);
+            static const int musicalDivs[] = { 1, 4, 7, 8, 9, 10 };      // 1/2, 1/4, 1/8, 1/8D, 1/8T, 1/16
+            set (pid::fxDiv, (float) musicalDivs[random.nextInt (6)]);
+            set (pid::fxRate, uni (0.2f, 4.0f));
+            set (pid::fxFreq, mode == 3 ? uni (550.0f, 900.0f) : uni (180.0f, 600.0f));
+            set (pid::fxDepth, uni (45.0f, 85.0f));
+            set (pid::fxReso, uni (40.0f, 80.0f));
+            set (pid::fxSens, uni (40.0f, 75.0f));
+            set (pid::fxShape, (float) (random.nextFloat() < 0.6f ? 0 : random.nextInt (6)));
+            set (pid::fxDrive, uni (0.0f, 50.0f) * a);
+            set (pid::fxStereo, random.nextFloat() < 0.5f ? 0.0f : uni (30.0f, 120.0f));
+            set (pid::fxMix, juce::jlimit (40.0f, 100.0f, 100.0f - a * uni (0.0f, 40.0f)));
+        }
+
+        void randomiseSpace (int engine, float a)
+        {
+            // underwater brings its own wash with WATER, so it needs this less
+            const bool verb = random.nextFloat() < (engine == Underwater ? 0.25f : 0.6f);
+            set (pid::revOn, verb ? 1.0f : 0.0f);
+            if (verb)
+            {
+                set (pid::revMix,   uni (10.0f, 30.0f) + a * 15.0f);
+                set (pid::revSize,  uni (35.0f, 80.0f));
+                set (pid::revDecay, uni (1.0f, 3.5f) + a * 2.0f);
+                set (pid::revDamp,  uni (40.0f, 85.0f));
+                set (pid::revPre,   uni (5.0f, 60.0f));
+                set (pid::revDuck,  uni (20.0f, 70.0f));
+            }
+
+            const bool delay = random.nextFloat() < 0.4f;
+            set (pid::dlyOn, delay ? 1.0f : 0.0f);
+            if (delay)
+            {
+                static const int musicalDivs[] = { 4, 5, 7, 8 };           // 1/4, 1/4D, 1/8, 1/8D
+                set (pid::dlySync, 1.0f);
+                set (pid::dlyDiv, (float) musicalDivs[random.nextInt (4)]);
+                set (pid::dlyMix, uni (10.0f, 26.0f));
+                set (pid::dlyFeedback, uni (20.0f, 50.0f));
+                set (pid::dlyTone, uni (25.0f, 60.0f));
+                set (pid::dlyPing, random.nextFloat() < 0.5f ? 1.0f : 0.0f);
+                set (pid::dlyDuck, uni (30.0f, 70.0f));
+                set (pid::dlyWarp, uni (0.0f, 35.0f) * a);
+            }
         }
 
         void randomiseOutput (float a)

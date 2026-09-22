@@ -15,6 +15,10 @@ OmgnedEditor::OmgnedEditor (OmgnedProcessor& p)
       deEsserPanel (p.apvts, [&p] { return p.getDeEsserReductionDb(); }),
       macroPanel (p.apvts),
       mixPanel (p.apvts),
+      filterFxPanel (p.apvts),
+      pitchModPanel (p.apvts),
+      reverbPanel (p.apvts),
+      delayPanel (p.apvts),
       advancedPanel (p.apvts,
                      [&p] { return p.getLatencySamples(); },
                      [&p] { return p.isSidechainConnected(); })
@@ -22,10 +26,16 @@ OmgnedEditor::OmgnedEditor (OmgnedProcessor& p)
     setLookAndFeel (&lookAndFeel);
 
     addAndMakeVisible (content);
-    for (auto* c : std::initializer_list<juce::Component*> {
-            &topBar, &inputSection, &engineSection, &outputSection,
-            &eqPanel, &compressorPanel, &deEsserPanel, &macroPanel, &mixPanel })
+    content.addAndMakeVisible (topBar);
+    for (auto* c : mainPanelComponents())
         content.addAndMakeVisible (c);
+
+    rackTabs.setPage ((int) processor.apvts.state.getProperty ("rackTab", 0), false);
+    rackTabs.onPageChanged = [this] (int page)
+    {
+        processor.apvts.state.setProperty ("rackTab", page, nullptr);
+        layoutContent();
+    };
 
     advancedViewport.setViewedComponent (&advancedPanel, false);
     advancedViewport.setScrollBarsShown (true, false);
@@ -51,6 +61,14 @@ OmgnedEditor::~OmgnedEditor()
 {
     stopTimer();
     setLookAndFeel (nullptr);
+}
+
+std::vector<juce::Component*> OmgnedEditor::mainPanelComponents()
+{
+    return { &inputSection, &engineSection, &outputSection, &rackTabs,
+             &eqPanel, &compressorPanel, &deEsserPanel,
+             &filterFxPanel, &pitchModPanel, &reverbPanel, &delayPanel,
+             &macroPanel, &mixPanel };
 }
 
 void OmgnedEditor::timerCallback()
@@ -109,7 +127,7 @@ void OmgnedEditor::layoutContent()
     juce::Rectangle<int> lower;
     if (roomForLower)
     {
-        lower = area.removeFromBottom (juce::jlimit (210, 340, h * 34 / 100));
+        lower = area.removeFromBottom (juce::jlimit (236, 360, h * 37 / 100));
         area.removeFromBottom (metric::space3);
     }
 
@@ -123,10 +141,17 @@ void OmgnedEditor::layoutContent()
     area.removeFromRight (gutter);
     engineSection.setBounds (area);
 
-    // ---- lower row ------------------------------------------------------------
-    eqPanel.setVisible (roomForLower);
-    compressorPanel.setVisible (roomForLower);
-    deEsserPanel.setVisible (roomForLower && roomForDeEsser);
+    // ---- lower row: the tabbed rack, then MACROS and MIX, always visible ----
+    const int page = rackTabs.getPage();
+    const std::vector<std::pair<juce::Component*, int>> pageOf {
+        { &eqPanel, 0 }, { &compressorPanel, 0 }, { &deEsserPanel, 0 },
+        { &filterFxPanel, 1 }, { &pitchModPanel, 1 },
+        { &reverbPanel, 2 }, { &delayPanel, 2 } };
+
+    for (auto& [c, pg] : pageOf)
+        c->setVisible (roomForLower && pg == page && (c != &deEsserPanel || roomForDeEsser));
+
+    rackTabs.setVisible (roomForLower);
     macroPanel.setVisible (roomForLower);
     mixPanel.setVisible (roomForLower);
 
@@ -134,25 +159,40 @@ void OmgnedEditor::layoutContent()
         return;
 
     const int gap = metric::space3;
-    // weights: EQ gets the space a display needs, MIX the least
-    const float weights = roomForDeEsser ? 2.15f + 1.5f + 1.05f + 1.3f + 0.85f
-                                         : 2.15f + 1.5f + 1.3f + 0.85f;
-    const float unit = ((float) lower.getWidth() - (roomForDeEsser ? 4 : 3) * (float) gap) / weights;
-    auto take = [&lower, gap] (float width)
+    const float rackWeight = roomForDeEsser ? 4.7f : 3.65f;
+    const float unit = ((float) lower.getWidth() - 2.0f * (float) gap) / (rackWeight + 1.3f + 0.85f);
+
+    auto rack = lower.removeFromLeft (juce::roundToInt (unit * rackWeight));
+    lower.removeFromLeft (gap);
+    macroPanel.setBounds (lower.removeFromLeft (juce::roundToInt (unit * 1.3f)));
+    lower.removeFromLeft (gap);
+    mixPanel.setBounds (lower);
+
+    rackTabs.setBounds (rack.removeFromTop (24));
+    rack.removeFromTop (metric::space2);
+
+    auto lay = [&rack, gap] (std::initializer_list<std::pair<juce::Component*, float>> items)
     {
-        auto r = lower.removeFromLeft (juce::roundToInt (width));
-        lower.removeFromLeft (gap);
-        return r;
+        float total = 0.0f;
+        for (auto& it : items) total += it.second;
+        const float u = ((float) rack.getWidth() - (float) gap * (float) (items.size() - 1)) / total;
+        auto r = rack;
+        int i = 0;
+        for (auto& it : items)
+        {
+            const bool last = ++i == (int) items.size();
+            it.first->setBounds (last ? r : r.removeFromLeft (juce::roundToInt (u * it.second)));
+            if (! last) r.removeFromLeft (gap);
+        }
     };
 
-    eqPanel.setBounds (take (unit * 2.15f));
-    compressorPanel.setBounds (take (unit * 1.5f));
-
     if (roomForDeEsser)
-        deEsserPanel.setBounds (take (unit * 1.05f));
+        lay ({ { &eqPanel, 2.15f }, { &compressorPanel, 1.5f }, { &deEsserPanel, 1.05f } });
+    else
+        lay ({ { &eqPanel, 2.15f }, { &compressorPanel, 1.5f } });
 
-    macroPanel.setBounds (take (unit * 1.3f));
-    mixPanel.setBounds (lower);
+    lay ({ { &filterFxPanel, 1.5f }, { &pitchModPanel, 1.0f } });
+    lay ({ { &reverbPanel, 1.0f }, { &delayPanel, 1.25f } });
 }
 
 void OmgnedEditor::toggleAdvanced()
@@ -161,9 +201,7 @@ void OmgnedEditor::toggleAdvanced()
     advancedViewport.setVisible (advancedVisible);
     topBar.setAdvancedActive (advancedVisible);
 
-    for (auto* c : std::initializer_list<juce::Component*> {
-            &inputSection, &engineSection, &outputSection,
-            &eqPanel, &compressorPanel, &deEsserPanel, &macroPanel, &mixPanel })
+    for (auto* c : mainPanelComponents())
         c->setVisible (! advancedVisible);
 
     layoutContent();
@@ -230,7 +268,8 @@ void OmgnedEditor::showHelp()
         juce::MessageBoxIconType::NoIcon, "OMGNEDD",
         "Pick an engine, turn CHARACTER, set MIX. Everything else refines that.\n\n"
         "UNDERWATER, DISTORTION and SATURATION each replace the centre controls. "
-        "The lower strip is always live: EQ, compressor, de-esser, the six vocal macros and the final mix.\n\n"
+        "The lower rack has three pages: TONE (EQ, compressor, de-esser), FX (wah, wobble, talk, phaser, "
+        "chorus and the pitch layer) and SPACE (reverb and delay). The six vocal macros and the final mix are always there.\n\n"
         "Every knob: drag to change, shift-drag for fine, wheel to nudge, double-click to reset, "
         "right-click to type a value or copy it to another control. Every control has a tooltip.\n\n"
         "ADV opens the engineering panel. A and B hold two complete states; the arrows copy one into the other.",

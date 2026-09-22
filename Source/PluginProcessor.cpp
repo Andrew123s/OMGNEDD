@@ -63,10 +63,12 @@ void OmgnedProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     currentSampleRate = sampleRate;
     currentBlockSize  = samplesPerBlock;
 
+    // linear-phase FIR half-band filters: their latency is a constant delay,
+    // so the dry path can be aligned with the engine path exactly
     for (int i = 0; i < 3; ++i)
     {
         oversamplers[(size_t) i] = std::make_unique<juce::dsp::Oversampling<float>> (
-            2, i + 1, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, true);
+            2, i + 1, juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple, true, true);
         oversamplers[(size_t) i]->initProcessing ((size_t) samplesPerBlock);
     }
 
@@ -78,21 +80,26 @@ void OmgnedProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     outputStage.prepare (base);
     transient.prepare (base);
     modulation.prepare (base);
+    filterFx.prepare (sampleRate, samplesPerBlock);
+    space.prepare (sampleRate, samplesPerBlock);
 
-    // the nonlinear engines and the crossover run inside the oversampler, so
-    // they are prepared at the highest rate they may ever be asked to run at
-    juce::dsp::ProcessSpec os { sampleRate * 8.0, (juce::uint32) (samplesPerBlock * 8), 2 };
-    underwater.prepare (os);
-    distortion.prepare (os);
-    saturation.prepare (os);
-    multiband.prepare (os);
+    // the engines allocate for the fastest rate they could ever run at, then
+    // applyEngineRate() tells them the rate they will actually run at
+    const double maxRate = sampleRate * 8.0;
+    underwater.prepare (maxRate, samplesPerBlock * 8);
+    distortion.prepare (maxRate, samplesPerBlock * 8);
+    saturation.prepare (maxRate, samplesPerBlock * 8);
+    multiband.prepare  (maxRate, samplesPerBlock * 8);
 
-    dryBuffer.setSize (2, samplesPerBlock, false, false, true);
+    dryBuffer.setSize     (2, samplesPerBlock, false, false, true);
     sidechainCopy.setSize (2, samplesPerBlock, false, false, true);
+    sideStash.setSize     (1, samplesPerBlock, false, false, true);
+    osScratch.setSize     (2, samplesPerBlock * 8, false, false, true);
+    xfadeScratch.setSize  (2, samplesPerBlock * 8, false, false, true);
 
-    // the widest the oversampler can ever hand back, allocated once here so
-    // processBlock never asks the allocator for anything
-    osScratch.setSize (2, samplesPerBlock * 8, false, false, true);
+    for (auto& d : dryAlign) d.allocate (1024);
+    for (auto& d : bypassAlign) d.allocate (4096);
+    sideAlign.allocate (1024);
 
     inGainSmooth.reset (sampleRate, 0.02, 1.0f);
     outGainSmooth.reset (sampleRate, 0.02, 1.0f);
@@ -104,20 +111,43 @@ void OmgnedProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     outputMeter.prepare (sampleRate, 2);
     spectrum.prepare (sampleRate);
 
-    lastOversamplingIndex = -1;
+    lastOsIndex = -1;
+    currentEngine = previousEngine = -1;
+    xfadeLeft = 0;
+    underwaterWeight = (int) raw (apvts, pid::engine) == Underwater ? 1.0f : 0.0f;
 }
 
 void OmgnedProcessor::releaseResources()
 {
-    underwater.reset(); distortion.reset(); saturation.reset();
+    underwater.reset(); distortion.reset(); saturation.reset(); multiband.reset();
     eq.reset(); compressor.reset(); deEsser.reset(); outputStage.reset();
-    modulation.reset(); multiband.reset(); transient.reset();
+    modulation.reset(); transient.reset(); filterFx.reset(); space.reset();
     for (auto& o : oversamplers) if (o != nullptr) o->reset();
-
+    for (auto& d : dryAlign) d.clear();
+    for (auto& d : bypassAlign) d.clear();
+    sideAlign.clear();
     driveMeterDb.store (-100.0f);
 }
 
-void OmgnedProcessor::pullParameters()
+omg::dsp::TransportInfo OmgnedProcessor::readTransport()
+{
+    TransportInfo t;
+
+    if (hasTransportOverride)
+        return transportOverride;
+
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+        {
+            if (auto bpm = pos->getBpm())         t.bpm = juce::jlimit (20.0, 400.0, *bpm);
+            if (auto ppq = pos->getPpqPosition()) t.ppqAtBlockStart = *ppq;
+            t.playing = pos->getIsPlaying();
+        }
+
+    return t;
+}
+
+void OmgnedProcessor::pullParameters (const TransportInfo& transport)
 {
     MacroEngine macros;
     macros.character = raw (apvts, pid::character);
@@ -144,6 +174,7 @@ void OmgnedProcessor::pullParameters()
     u.modShape = (int) raw (apvts, pid::uwModShape);
     macros.applyUnderwater (u);
     underwater.setParams (u);
+    washAmount = underwater.getWashAmount() * pct (u.mix);
 
     DistortionEngine::Params d;
     d.drive = raw (apvts, pid::dsDrive);   d.bite = raw (apvts, pid::dsBite);
@@ -165,6 +196,14 @@ void OmgnedProcessor::pullParameters()
     macros.applySaturation (s);
     saturation.setParams (s);
 
+    MultibandDrive::Params mb;
+    mb.low = raw (apvts, pid::mbLow);   mb.mid = raw (apvts, pid::mbMid);
+    mb.high = raw (apvts, pid::mbHigh);
+    mb.crossLow = raw (apvts, pid::mbCrossLow);
+    mb.crossHigh = raw (apvts, pid::mbCrossHigh);
+    mb.enabled = raw (apvts, pid::mbOn) > 0.5f;
+    multiband.setParams (mb);
+
     // ---- EQ ---------------------------------------------------------------
     std::array<EqSection::Band, kNumEqBands> bands;
     for (int b = 0; b < kNumEqBands; ++b)
@@ -175,6 +214,7 @@ void OmgnedProcessor::pullParameters()
         bands[(size_t) b].type    = (int) rawEq (apvts, b, "Type");
         bands[(size_t) b].on      = rawEq (apvts, b, "On") > 0.5f;
         bands[(size_t) b].dynamic = rawEq (apvts, b, "Dyn") > 0.5f;
+        bands[(size_t) b].slope   = (int) rawEq (apvts, b, "Slope");
     }
     macros.applyEq (bands);
 
@@ -207,24 +247,6 @@ void OmgnedProcessor::pullParameters()
     macros.applyTransient (t);
     transient.setParams (t);
 
-    ModulationEngine::Params m;
-    m.rate = raw (apvts, pid::modRate);      m.depth  = raw (apvts, pid::modDepth);
-    m.detune = raw (apvts, pid::modDetune);  m.width  = raw (apvts, pid::modWidth);
-    m.motion = raw (apvts, pid::modMotion);  m.mix    = raw (apvts, pid::modMix);
-    m.mode = (int) raw (apvts, pid::modMode);
-    m.enabled = raw (apvts, pid::modOn) > 0.5f;
-    m.chaos = macros.chaos;
-    macros.applyModulation (m);
-    modulation.setParams (m);
-
-    MultibandDrive::Params mb;
-    mb.low = raw (apvts, pid::mbLow);   mb.mid = raw (apvts, pid::mbMid);
-    mb.high = raw (apvts, pid::mbHigh);
-    mb.crossLow = raw (apvts, pid::mbCrossLow);
-    mb.crossHigh = raw (apvts, pid::mbCrossHigh);
-    mb.enabled = raw (apvts, pid::mbOn) > 0.5f;
-    multiband.setParams (mb);
-
     DeEsser::Params de;
     de.freq = raw (apvts, pid::deFreq);        de.threshold = raw (apvts, pid::deThresh);
     de.amount = raw (apvts, pid::deAmount);    de.range = raw (apvts, pid::deRange);
@@ -232,6 +254,76 @@ void OmgnedProcessor::pullParameters()
     de.listen = raw (apvts, pid::deListen) > 0.5f;
     de.enabled = raw (apvts, pid::deOn) > 0.5f;
     deEsser.setParams (de);
+
+    // ---- movement ------------------------------------------------------------
+    ModulationEngine::Params m;
+    m.rate = raw (apvts, pid::modRate);      m.depth  = raw (apvts, pid::modDepth);
+    m.detune = raw (apvts, pid::modDetune);  m.width  = raw (apvts, pid::modWidth);
+    m.motion = raw (apvts, pid::modMotion);  m.mix    = raw (apvts, pid::modMix);
+    m.mode = (int) raw (apvts, pid::modMode);
+    m.enabled = raw (apvts, pid::modOn) > 0.5f;
+    m.shiftSemis = raw (apvts, pid::pitShift);
+    m.shiftMix = raw (apvts, pid::pitMix);
+    macros.applyModulation (m);
+    modulation.setParams (m);
+
+    FilterFx::Params fx;
+    fx.on = raw (apvts, pid::fxOn) > 0.5f;
+    fx.mode = (int) raw (apvts, pid::fxMode);
+    fx.sync = raw (apvts, pid::fxSync) > 0.5f;
+    fx.div = (int) raw (apvts, pid::fxDiv);
+    fx.rateHz = raw (apvts, pid::fxRate);
+    fx.freq = raw (apvts, pid::fxFreq);
+    fx.depth = raw (apvts, pid::fxDepth);
+    fx.reso = raw (apvts, pid::fxReso);
+    fx.sens = raw (apvts, pid::fxSens);
+    fx.shape = (int) raw (apvts, pid::fxShape);
+    fx.drive = raw (apvts, pid::fxDrive);
+    fx.stereo = raw (apvts, pid::fxStereo);
+    fx.mix = raw (apvts, pid::fxMix);
+    filterFx.setParams (fx, transport);
+
+    // ---- space: the panel, the macros, and the underwater wash --------------
+    SpaceEngine::Params sp;
+    sp.revOn = raw (apvts, pid::revOn) > 0.5f;
+    sp.revMix = raw (apvts, pid::revMix);     sp.revSize = raw (apvts, pid::revSize);
+    sp.revDecay = raw (apvts, pid::revDecay); sp.revDamp = raw (apvts, pid::revDamp);
+    sp.revPre = raw (apvts, pid::revPre);     sp.revDuck = raw (apvts, pid::revDuck);
+    sp.dlyOn = raw (apvts, pid::dlyOn) > 0.5f;
+    sp.dlyMix = raw (apvts, pid::dlyMix);
+    sp.dlySync = raw (apvts, pid::dlySync) > 0.5f;
+    sp.dlyDiv = (int) raw (apvts, pid::dlyDiv);
+    sp.dlyTimeMs = raw (apvts, pid::dlyTime);
+    sp.dlyFeedback = raw (apvts, pid::dlyFeedback);
+    sp.dlyTone = raw (apvts, pid::dlyTone);
+    sp.dlyPing = raw (apvts, pid::dlyPing) > 0.5f;
+    sp.dlyDuck = raw (apvts, pid::dlyDuck);
+    sp.dlyWarp = raw (apvts, pid::dlyWarp);
+    macros.applySpace (sp);
+
+    // WATER's wash: a dark, ducked reverb and a dark ping-pong 1/8 dotted
+    // delay. If the SPACE page's own reverb or delay is on, the wash adds to
+    // its level and leaves its settings alone.
+    const float wash = washAmount * underwaterWeight;
+    if (wash > 0.002f)
+    {
+        if (! sp.revOn)
+        {
+            sp.revOn = true;  sp.revMix = 0.0f;
+            sp.revSize = 72.0f; sp.revDecay = 1.8f + wash * 4.4f; sp.revDamp = 64.0f + wash * 30.0f;
+            sp.revPre = 16.0f; sp.revDuck = 58.0f;
+        }
+        sp.revMix = MacroEngine::push (sp.revMix, wash * 62.0f, 0.0f, 100.0f);
+
+        if (! sp.dlyOn)
+        {
+            sp.dlyOn = true; sp.dlyMix = 0.0f; sp.dlySync = true; sp.dlyDiv = 8;
+            sp.dlyFeedback = 28.0f + wash * 28.0f; sp.dlyTone = 28.0f; sp.dlyPing = true;
+            sp.dlyDuck = 62.0f; sp.dlyWarp = 30.0f;
+        }
+        sp.dlyMix = MacroEngine::push (sp.dlyMix, wash * 24.0f, 0.0f, 100.0f);
+    }
+    space.setParams (sp, transport);
 
     // ---- output ------------------------------------------------------------
     OutputStage::Params o;
@@ -244,24 +336,99 @@ void OmgnedProcessor::pullParameters()
     o.mono = raw (apvts, pid::mono) > 0.5f;
     macros.applyOutput (o);
     outputStage.setParams (o);
+
+    midSideEngine = o.ms;
 }
 
-/** The character engine, with the multiband pre and post gains around it and
-    the oversampler around the pair. Kept out of processBlock so the routing
-    reads in one piece.
-*/
-void OmgnedProcessor::runCharacterChain (juce::AudioBuffer<float>& buffer, int engineMode, int osIndex)
+void OmgnedProcessor::processEngine (int engine, juce::AudioBuffer<float>& b)
 {
-    auto runEngine = [this, engineMode] (juce::AudioBuffer<float>& b)
+    switch (engine)
+    {
+        case Distortion: distortion.process (b); break;
+        case Saturation: saturation.process (b); break;
+        case Underwater:
+        default:         underwater.process (b); break;
+    }
+}
+
+void OmgnedProcessor::resetEngine (int engine)
+{
+    switch (engine)
+    {
+        case Distortion: distortion.reset(); break;
+        case Saturation: saturation.reset(); break;
+        case Underwater:
+        default:         underwater.reset(); break;
+    }
+}
+
+/** Tells every module inside the oversampler the rate it now runs at. This is
+    the fix for the fault that made the first version sound flat: the engines
+    were prepared for eight times the session rate and then run at two, so
+    every filter, LFO and envelope in them was out by a factor of four. */
+void OmgnedProcessor::applyEngineRate (int osIndex)
+{
+    const double rate = currentSampleRate * (double) (1 << osIndex);
+    underwater.setSampleRate (rate);
+    distortion.setSampleRate (rate);
+    saturation.setSampleRate (rate);
+    multiband.setSampleRate (rate);
+
+    for (auto& o : oversamplers) if (o != nullptr) o->reset();
+
+    engineLatency = osIndex == 0 ? 0.0f : oversamplers[(size_t) (osIndex - 1)]->getLatencyInSamples();
+    setLatencySamples (juce::roundToInt (engineLatency) + outputStage.getLatencySamples());
+    lastOsIndex = osIndex;
+}
+
+void OmgnedProcessor::runCharacterChain (juce::AudioBuffer<float>& buffer, int osIndex)
+{
+    const int wanted = juce::jlimit (0, 2, (int) raw (apvts, pid::engine));
+    const double runRate = currentSampleRate * (double) (1 << osIndex);
+
+    if (currentEngine < 0)
+    {
+        currentEngine = wanted;
+    }
+    else if (wanted != currentEngine)
+    {
+        previousEngine = currentEngine;
+        currentEngine = wanted;
+        resetEngine (currentEngine);
+        xfadeTotal = juce::jmax (1, (int) (0.030 * runRate));
+        xfadeLeft = xfadeTotal;
+    }
+
+    auto run = [this] (juce::AudioBuffer<float>& b)
     {
         multiband.applyPre (b);
 
-        switch (engineMode)
+        if (xfadeLeft > 0 && previousEngine >= 0)
         {
-            case Distortion: distortion.process (b); break;
-            case Saturation: saturation.process (b); break;
-            case Underwater:
-            default:         underwater.process (b); break;
+            const int n = b.getNumSamples();
+            const int ch = juce::jmin (b.getNumChannels(), xfadeScratch.getNumChannels());
+            juce::AudioBuffer<float> old (xfadeScratch.getArrayOfWritePointers(), ch, n);
+            for (int c = 0; c < ch; ++c) old.copyFrom (c, 0, b, c, 0, n);
+
+            processEngine (currentEngine, b);
+            processEngine (previousEngine, old);
+
+            int left = xfadeLeft;
+            for (int i = 0; i < n; ++i)
+            {
+                const float t = left > 0 ? (float) left / (float) xfadeTotal : 0.0f;   // 1 -> 0
+                const float gOld = std::sin (t * juce::MathConstants<float>::halfPi);
+                const float gNew = std::cos (t * juce::MathConstants<float>::halfPi);
+                for (int c = 0; c < ch; ++c)
+                    b.setSample (c, i, b.getSample (c, i) * gNew + old.getSample (c, i) * gOld);
+                if (left > 0) --left;
+            }
+            xfadeLeft = left;
+            if (xfadeLeft == 0) previousEngine = -1;
+        }
+        else
+        {
+            processEngine (currentEngine, b);
         }
 
         multiband.applyPost (b);
@@ -269,8 +436,7 @@ void OmgnedProcessor::runCharacterChain (juce::AudioBuffer<float>& buffer, int e
 
     if (osIndex == 0)
     {
-        runEngine (buffer);
-        setLatencySamples (0);
+        run (buffer);
         return;
     }
 
@@ -278,43 +444,60 @@ void OmgnedProcessor::runCharacterChain (juce::AudioBuffer<float>& buffer, int e
     juce::dsp::AudioBlock<float> block (buffer);
     auto upBlock = os.processSamplesUp (block);
 
-    const int upCh = (int) upBlock.getNumChannels();
-    const int upN  = (int) upBlock.getNumSamples();
+    const int upCh = juce::jmin ((int) upBlock.getNumChannels(), osScratch.getNumChannels());
+    const int upN  = juce::jmin ((int) upBlock.getNumSamples(), osScratch.getNumSamples());
 
-    // osScratch was sized at prepare for the widest case, so this is a view
-    // onto memory that already exists rather than an allocation
-    jassert (upCh <= osScratch.getNumChannels() && upN <= osScratch.getNumSamples());
+    juce::AudioBuffer<float> upBuffer (osScratch.getArrayOfWritePointers(), upCh, upN);
+    for (int c = 0; c < upCh; ++c)
+        juce::FloatVectorOperations::copy (upBuffer.getWritePointer (c), upBlock.getChannelPointer ((size_t) c), upN);
 
-    juce::AudioBuffer<float> upBuffer (osScratch.getArrayOfWritePointers(),
-                                       juce::jmin (upCh, osScratch.getNumChannels()),
-                                       juce::jmin (upN, osScratch.getNumSamples()));
+    run (upBuffer);
 
-    for (int c = 0; c < upBuffer.getNumChannels(); ++c)
-        juce::FloatVectorOperations::copy (upBuffer.getWritePointer (c),
-                                           upBlock.getChannelPointer ((size_t) c),
-                                           upBuffer.getNumSamples());
-
-    runEngine (upBuffer);
-
-    for (int c = 0; c < upBuffer.getNumChannels(); ++c)
-        juce::FloatVectorOperations::copy (upBlock.getChannelPointer ((size_t) c),
-                                           upBuffer.getReadPointer (c),
-                                           upBuffer.getNumSamples());
+    for (int c = 0; c < upCh; ++c)
+        juce::FloatVectorOperations::copy (upBlock.getChannelPointer ((size_t) c), upBuffer.getReadPointer (c), upN);
 
     os.processSamplesDown (block);
-    setLatencySamples ((int) os.getLatencyInSamples());
+}
+
+void OmgnedProcessor::passThroughAligned (juce::AudioBuffer<float>& work)
+{
+    // latency is measured from when POWER was last on; if the plugin has never
+    // processed, apply the latency it would report for the current settings
+    if (lastOsIndex < 0)
+        applyEngineRate (juce::jlimit (0, 3, (int) raw (apvts, pid::oversampling)));
+
+    const float latency = (float) getLatencySamples();
+    for (int c = 0; c < juce::jmin (2, work.getNumChannels()); ++c)
+    {
+        auto& line = bypassAlign[(size_t) c];
+        auto* d = work.getWritePointer (c);
+        for (int i = 0; i < work.getNumSamples(); ++i) { line.push (d[i]); d[i] = line.read (latency); }
+    }
+}
+
+void OmgnedProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    auto mainIn = getBusBuffer (buffer, true, 0);
+    juce::AudioBuffer<float> work (mainIn.getArrayOfWritePointers(), juce::jmin (2, mainIn.getNumChannels()), mainIn.getNumSamples());
+    for (int c = getTotalNumInputChannels(); c < getTotalNumOutputChannels(); ++c)
+        buffer.clear (c, 0, buffer.getNumSamples());
+    passThroughAligned (work);
 }
 
 void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
-    auto mainIn  = getBusBuffer (buffer, true, 0);
+    auto mainIn = getBusBuffer (buffer, true, 0);
     const int numSamples = mainIn.getNumSamples();
     const int numCh = juce::jmin (2, mainIn.getNumChannels());
 
     for (int c = getTotalNumInputChannels(); c < getTotalNumOutputChannels(); ++c)
         buffer.clear (c, 0, buffer.getNumSamples());
+
+    if (numSamples == 0 || numCh == 0)
+        return;
 
     // ---- the external sidechain, taken before anything touches the main bus --
     const bool haveSidechain = getBusCount (true) > 1
@@ -327,7 +510,6 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     {
         auto scIn = getBusBuffer (buffer, true, 1);
         const int scCh = juce::jmin (2, scIn.getNumChannels());
-
         if (scCh > 0 && numSamples <= sidechainCopy.getNumSamples())
         {
             for (int c = 0; c < 2; ++c)
@@ -336,21 +518,45 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         }
     }
 
-    // the plugin works on the main bus only; a wider buffer keeps its tail
     juce::AudioBuffer<float> work (mainIn.getArrayOfWritePointers(), numCh, numSamples);
-
     inputMeter.push (work);
+
+    // the bypass line always carries the input, so switching POWER off
+    // continues the audio from exactly where it was rather than from silence
+    const bool poweredNow = raw (apvts, pid::power) > 0.5f;
+    if (poweredNow)
+        for (int c = 0; c < numCh; ++c)
+        {
+            auto& line = bypassAlign[(size_t) c];
+            const auto* d = work.getReadPointer (c);
+            for (int i = 0; i < numSamples; ++i) line.push (d[i]);
+        }
+
+    const auto transport = readTransport();
+    currentBpm.store (transport.bpm);
 
     const bool powered = raw (apvts, pid::power) > 0.5f;
     if (! powered)
     {
+        passThroughAligned (work);
         outputMeter.push (work);
         driveMeterDb.store (-100.0f);
-        if (numCh > 0) spectrum.push (work.getReadPointer (0), numSamples);
+        spectrum.push (work.getReadPointer (0), numSamples);
         return;
     }
 
-    pullParameters();
+    // ---- follow the engine for the underwater wash, over about 80 ms ---------
+    {
+        const float target = (int) raw (apvts, pid::engine) == Underwater ? 1.0f : 0.0f;
+        const float k = juce::jmin (1.0f, (float) numSamples / (float) (0.08 * currentSampleRate));
+        underwaterWeight += (target - underwaterWeight) * k;
+    }
+
+    pullParameters (transport);
+
+    const int osIndex = juce::jlimit (0, 3, (int) raw (apvts, pid::oversampling));
+    if (osIndex != lastOsIndex)
+        applyEngineRate (osIndex);
 
     // ---- input gain --------------------------------------------------------
     const float inTarget = dsp::dbToGain (raw (apvts, pid::inGain));
@@ -361,36 +567,64 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
             work.setSample (c, i, work.getSample (c, i) * g);
     }
 
-    // ---- dry copy for the final mix ----------------------------------------
-    if (dryBuffer.getNumSamples() < numSamples || dryBuffer.getNumChannels() < numCh)
-        dryBuffer.setSize (juce::jmax (2, numCh), juce::jmax (numSamples, currentBlockSize), false, false, true);
+    // ---- dry copy for the final mix, delayed to line up with the engine ------
+    if (dryBuffer.getNumSamples() < numSamples)
+        dryBuffer.setSize (2, numSamples, false, false, true);
 
+    const float latency = engineLatency;
     for (int c = 0; c < numCh; ++c)
-        dryBuffer.copyFrom (c, 0, work, c, 0, numSamples);
+    {
+        auto& line = dryAlign[(size_t) c];
+        const auto* src = work.getReadPointer (c);
+        auto* dst = dryBuffer.getWritePointer (c);
+        for (int i = 0; i < numSamples; ++i) { line.push (src[i]); dst[i] = line.read (latency); }
+    }
 
-    // ---- tone, then the vocal shaping in front of the character -------------
+    // ---- tone and vocal shaping in front of the character --------------------
     eq.process (work);
     deEsser.process (work);
     transient.process (work);
 
     const int compPlacement = juce::jlimit (0, 1, (int) raw (apvts, pid::compPlace));
-
     if (compPlacement == CompPre)
         compressor.process (work, sidechain);
 
-    // ---- what the character engine is about to be handed, for the meter -----
     driveMeterDb.store (dsp::gainToDb (work.getMagnitude (0, numSamples)));
 
-    // ---- character engine, with the multiband gains and the oversampler -----
-    runCharacterChain (work,
-                       juce::jlimit (0, 2, (int) raw (apvts, pid::engine)),
-                       juce::jlimit (0, 3, (int) raw (apvts, pid::oversampling)));
+    // ---- M/S: the engine hears the mid only, the side waits aligned ---------
+    const bool ms = midSideEngine && numCh == 2;
+    if (ms)
+    {
+        auto* L = work.getWritePointer (0);
+        auto* R = work.getWritePointer (1);
+        auto* S = sideStash.getWritePointer (0);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float mid = 0.5f * (L[i] + R[i]);
+            sideAlign.push (0.5f * (L[i] - R[i]));
+            S[i] = sideAlign.read (latency);
+            L[i] = R[i] = mid;
+        }
+    }
 
-    // ---- movement, after the character so it modulates the result -----------
+    runCharacterChain (work, osIndex);
+
+    if (ms)
+    {
+        auto* L = work.getWritePointer (0);
+        auto* R = work.getWritePointer (1);
+        const auto* S = sideStash.getReadPointer (0);
+        for (int i = 0; i < numSamples; ++i) { L[i] += S[i]; R[i] -= S[i]; }
+    }
+
+    // ---- movement and space ----------------------------------------------------
     modulation.process (work);
+    filterFx.process (work);
 
     if (compPlacement == CompPost)
         compressor.process (work, sidechain);
+
+    space.process (work);
 
     // ---- global dry / wet ----------------------------------------------------
     const float mixTarget = dsp::pct (raw (apvts, pid::mix));
@@ -406,15 +640,13 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         for (int c = 0; c < numCh; ++c)
         {
             const float wet = work.getSample (c, i) * wg;
-            const float dry = dryBuffer.getSample (juce::jmin (c, dryBuffer.getNumChannels() - 1), i) * dg;
-            work.setSample (c, i, dry + (wet - dry) * m);
+            const float dry = dryBuffer.getSample (c, i) * dg;
+            work.setSample (c, i, dry * (1.0f - m) + wet * m);
         }
     }
 
-    // ---- stereo, limiter, safety ------------------------------------------------
-    outputStage.process (work);
-
-    // ---- output gain -------------------------------------------------------------
+    // ---- output gain, then the limiter and the safety clip, which are last:
+    // nothing, OUTPUT GAIN included, can push the plugin past its ceiling -----
     const float outTarget = dsp::dbToGain (raw (apvts, pid::outGain));
     for (int i = 0; i < numSamples; ++i)
     {
@@ -423,7 +655,9 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
             work.setSample (c, i, work.getSample (c, i) * g);
     }
 
-    // ---- last line of defence: nothing infinite ever leaves the plugin -----------
+    outputStage.process (work);
+
+    // ---- nothing non-finite ever leaves the plugin ------------------------------
     for (int c = 0; c < numCh; ++c)
     {
         auto* d = work.getWritePointer (c);
@@ -433,8 +667,10 @@ void OmgnedProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
     }
 
     outputMeter.push (work);
-    if (numCh > 0)
-        spectrum.push (work.getReadPointer (0), numSamples);
+    spectrum.push (work.getReadPointer (0), numSamples);
+
+    if (hasTransportOverride)
+        transportOverride.ppqAtBlockStart += numSamples * transportOverride.bpm / 60.0 / currentSampleRate;
 }
 
 void OmgnedProcessor::setEditorSize (int w, int h)

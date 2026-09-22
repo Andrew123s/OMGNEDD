@@ -13,6 +13,7 @@
 #include "UI/MacroPanel.h"
 #include "UI/AdvancedPanel.h"
 #include "UI/PresetBrowserComponent.h"
+#include "UI/RackPanels.h"
 
 /** The whole interface, laid out in design units and scaled to whatever size the
     host gives it. Nothing here owns a control: the sections do.
@@ -35,6 +36,7 @@ private:
     void setZoom (float factor);
     void toggleAdvanced();
     void openBrowser();
+    std::vector<juce::Component*> mainPanelComponents();
     void closeBrowser();
 
     OmgnedProcessor& processor;
@@ -53,6 +55,13 @@ private:
     omg::ui::DeEsserPanel deEsserPanel;
     omg::ui::MacroPanel macroPanel;
     omg::ui::MixPanel mixPanel;
+
+    // the lower rack: TONE (EQ, compressor, de-esser), FX and SPACE pages
+    omg::ui::RackTabs rackTabs;
+    omg::ui::FilterFxPanel filterFxPanel;
+    omg::ui::PitchModPanel pitchModPanel;
+    omg::ui::ReverbPanel reverbPanel;
+    omg::ui::DelayPanel delayPanel;
     omg::ui::AdvancedPanel advancedPanel;
     /** The advanced panel is taller than the window at small sizes, so it lives
         in a viewport: every group stays reachable rather than being clipped. */

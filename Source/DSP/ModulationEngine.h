@@ -1,5 +1,6 @@
 #pragma once
 #include "Utils.h"
+#include "Filters.h"
 
 namespace omg::dsp
 {
@@ -34,6 +35,10 @@ namespace omg::dsp
             float rate = 35, depth = 30, detune = 20, width = 50, motion = 25, mix = 35;
             int   mode = Chorus;
             bool  enabled = false, chaos = false;
+
+            // the pitch layer: independent of the modulation switch
+            float shiftSemis = 0.0f;       // -12 .. +12
+            float shiftMix = 0.0f;         // %
         };
 
         void prepare (const juce::dsp::ProcessSpec& spec)
@@ -50,9 +55,19 @@ namespace omg::dsp
                 ch.phase = 0.0;
                 ch.randomWalk = 0.0f;
                 ch.delaySmooth.reset (sampleRate, 0.010, 14.0f);
-                ch.hp.prepare (spec);
-                ch.hp.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 90.0f, 0.707f);
+                ch.hp.set (BiquadCoeffs::highPass (sampleRate, 90.0, 0.707));
+                ch.pitchLine.allocate ((int) (0.12 * sampleRate) + 8);
+                ch.driftRate = 0.0f; ch.driftDepth = 0.0f;
             }
+            shiftMixSmooth.setTime (sampleRate, 0.03);
+            for (size_t c = 0; c < chans.size(); ++c)
+            {
+                chans[c].random.setSeed ((juce::int64) (0x3D0 + c));
+                chans[c].lfo.random.setSeed ((juce::int64) (0x1F0 + c));
+                chans[c].drift.random.setSeed ((juce::int64) (0x2F0 + c));
+            }
+            driftCoef = 1.0f - (float) std::exp (-1.0 / (0.15 * sampleRate));
+            shiftMixSmooth.reset (0.0f);
 
             setParams (p);
         }
@@ -65,6 +80,10 @@ namespace omg::dsp
                 ch.writePos = 0;
                 ch.randomWalk = 0.0f;
                 ch.hp.reset();
+                ch.pitchLine.clear();
+                ch.pitchPhase = 0.0f;
+                ch.driftDepth = ch.driftTarget = 0.0f;
+                ch.driftT = 0.0;
             }
         }
 
@@ -103,6 +122,13 @@ namespace omg::dsp
             motionAmt = pct (p.motion);
             mixAmt    = pct (p.mix);
 
+            // the pitch layer, with a longer window than micro pitch because
+            // an octave shift needs one to avoid sounding like a tremolo
+            const float semis = juce::jlimit (-12.0f, 12.0f, p.shiftSemis);
+            shiftRatioMinusOne = (float) (std::pow (2.0, semis / 12.0) - 1.0);
+            shiftWindow = (float) (sampleRate * 0.055);
+            shiftActive = std::abs (semis) > 0.01f;
+
             // MOTION widens the modulation and, on the tape modes, adds drift
             const double spread = 0.5 * (double) widthAmt;
 
@@ -126,6 +152,51 @@ namespace omg::dsp
 
         void process (juce::AudioBuffer<float>& buffer)
         {
+            processModulation (buffer);
+            processPitchLayer (buffer);
+        }
+
+    private:
+        void processPitchLayer (juce::AudioBuffer<float>& buffer)
+        {
+            const float target = shiftActive ? pct (p.shiftMix) : 0.0f;
+            if (target <= 0.0001f && shiftMixSmooth.z <= 0.0001f)
+                return;
+
+            const int numCh = juce::jmin (2, buffer.getNumChannels());
+            const int n = buffer.getNumSamples();
+
+            for (int i = 0; i < n; ++i)
+            {
+                const float m = shiftMixSmooth.process (target);
+                const float dryG = juce::jmin (1.0f, 2.0f * (1.0f - m));
+                const float wetG = juce::jmin (1.0f, 2.0f * m);
+
+                for (int c = 0; c < numCh; ++c)
+                {
+                    auto& ch = chans[(size_t) c];
+                    auto* d = buffer.getWritePointer (c);
+                    const float dry = d[i];
+                    ch.pitchLine.push (dry);
+
+                    // two heads sliding at (1 - ratio) samples per sample,
+                    // half a window apart, raised-cosine crossfaded
+                    ch.pitchPhase -= shiftRatioMinusOne / shiftWindow;
+                    ch.pitchPhase -= std::floor (ch.pitchPhase);
+                    const float p1 = ch.pitchPhase;
+                    const float p2 = p1 >= 0.5f ? p1 - 0.5f : p1 + 0.5f;
+                    const float g1 = 0.5f - 0.5f * std::cos (p1 * juce::MathConstants<float>::twoPi);
+                    const float g2 = 0.5f - 0.5f * std::cos (p2 * juce::MathConstants<float>::twoPi);
+                    const float shifted = ch.pitchLine.read (4.0f + p1 * shiftWindow) * g1
+                                        + ch.pitchLine.read (4.0f + p2 * shiftWindow) * g2;
+
+                    d[i] = dry * dryG + shifted * wetG;
+                }
+            }
+        }
+
+        void processModulation (juce::AudioBuffer<float>& buffer)
+        {
             if (! p.enabled || mixAmt <= 0.0001f)
                 return;
 
@@ -143,7 +214,7 @@ namespace omg::dsp
 
                     // the line is fed the dry signal, high passed so modulation
                     // never smears the low end of the vocal
-                    ch.line[(size_t) ch.writePos] = ch.hp.processSample (dry);
+                    ch.line[(size_t) ch.writePos] = ch.hp.process (dry);
 
                     float wet = 0.0f;
 
@@ -154,7 +225,15 @@ namespace omg::dsp
                     }
                     else
                     {
-                        float mod = ch.lfo.next (Lfo::Sine);
+                        // MOTION: a slow wander, a new random target about
+                        // twice a second glided towards over 150 ms, moving
+                        // the depth and the centre of the modulation, so the
+                        // movement is never regular
+                        ch.driftT += 2.1 / sampleRate;
+                        if (ch.driftT >= 1.0) { ch.driftT -= 1.0; ch.driftTarget = ch.random.nextFloat() * 2.0f - 1.0f; }
+                        ch.driftDepth += (ch.driftTarget - ch.driftDepth) * driftCoef;
+                        float mod = ch.lfo.next (Lfo::Sine) * (1.0f + motionAmt * 0.8f * ch.driftDepth)
+                                  + motionAmt * 0.9f * ch.driftDepth;
 
                         if (p.mode == TapeWow)
                             mod = mod * 0.75f + ch.drift.next (Lfo::Sine) * 0.25f * (0.4f + motionAmt);
@@ -199,7 +278,11 @@ namespace omg::dsp
             int   writePos { 0 };
             Lfo   lfo, drift;
             Smooth delaySmooth;
-            juce::dsp::IIR::Filter<float> hp;
+            Biquad hp;
+            DelayLine pitchLine;
+            float pitchPhase { 0.0f };
+            float driftRate { 0.0f }, driftDepth { 0.0f }, driftTarget { 0.0f };
+            double driftT { 0.0 };
             juce::Random random;
             double phase { 0.0 };
             float randomWalk { 0.0f };
@@ -250,6 +333,10 @@ namespace omg::dsp
 
         std::array<Channel, 2> chans;
         Params p;
+        OnePole shiftMixSmooth;
+        float driftCoef { 0.001f };
+        float shiftRatioMinusOne { 0.0f }, shiftWindow { 2400.0f };
+        bool  shiftActive { false };
         double sampleRate { 44100.0 };
         int    maxDelaySamples { 4096 };
         float  lfoHz { 1.0f }, baseDelayMs { 14.0f }, depthMs { 3.0f };

@@ -116,7 +116,7 @@ The VST3 lands in `build/OMGNEDD_artefacts/Release/VST3/`. Copy it to
 ## The other targets
 
 ```bash
-# the verification suite
+# the verification suite (--quick skips the knob sweep, --report prints it)
 cmake --build build --target OMGNEDD_Tests
 ./build/OMGNEDD_Tests_artefacts/Release/OMGNEDD_Tests
 
@@ -166,12 +166,22 @@ Reset the window with **SETTINGS → 100 %**. The editor size is stored with the
 session, so a project saved on a much larger screen can open off-screen.
 
 **It sounds quiet, or the level jumps when I move DRIVE.**
-It should not: every drive control has matched makeup. If it does, check INPUT
-GAIN and the dry/wet levels in the ADV panel's GAIN STAGING group, and check
-that MIX is where you think it is — the MIX module prints the dry and wet
-percentages under the knob.
+It should not: every engine has automatic level matching, so DRIVE and DEPTH
+change the character rather than the level. If it does, check INPUT GAIN and
+the dry/wet levels in the ADV panel's GAIN STAGING group, and check that MIX is
+where you think it is: the MIX module prints the dry and wet percentages under
+the knob.
+
+**A synced wobble or delay drifts against the beat.**
+It follows the host transport. Check that the FL Studio project tempo is what
+you think it is and that the song is playing; when the transport is stopped the
+LFO free-runs at the synced rate and cannot know where the beat is.
+
+**The reverb or delay tail cuts off at the end of a clip.**
+The plugin reports an 8 s tail. If FL Studio still cuts it, render with
+*Leave remainder* (tail) enabled in the export dialog.
 
 **High CPU.**
-Turn oversampling down. The figures are in [TESTING.md](TESTING.md#cpu). 8x
-costs roughly twice what 2x does, and 2x is enough for anything short of extreme
-CRUSH and FOLD settings.
+Turn oversampling down. The figures are in [TESTING.md](TESTING.md#cpu). 2x is
+enough for anything short of extreme CRUSH and FOLD settings, and the sound does
+not change with the setting, only the aliasing does.

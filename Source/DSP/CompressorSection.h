@@ -1,5 +1,6 @@
 #pragma once
 #include "Utils.h"
+#include "Filters.h"
 
 namespace omg::dsp
 {
@@ -29,7 +30,7 @@ namespace omg::dsp
             sampleRate = spec.sampleRate;
             for (auto& ch : chans)
             {
-                ch.sc.prepare (spec);
+                ch.sc.reset();
                 ch.env.prepare (spec.sampleRate);
                 ch.rms = 0.0f;
             }
@@ -65,8 +66,13 @@ namespace omg::dsp
             if (p.autoMode) { atk = 18.0f; rel = 220.0f; }
 
             effectiveKnee = juce::jlimit (0.0f, 24.0f, knee);
-            // the mode suggests a detector, the DETECTOR control overrides it
-            useRms = p.detector == Rms;
+            // OPTO and SMOOTH are RMS by nature; elsewhere DETECTION decides
+            useRms = p.detector == Rms || p.mode == Opto || p.mode == Smooth;
+
+            // AGGRESSIVE compresses harder and drives its own output into a
+            // soft clip: the slammed sound, not just faster timing
+            ratioScale = p.mode == Aggressive ? 1.8f : p.mode == Opto ? 0.8f : 1.0f;
+            slam = p.mode == Aggressive ? 1.6f : 0.0f;
 
             baseReleaseMs = juce::jlimit (5.0f, 2000.0f, rel);
             attackMs      = juce::jlimit (0.1f, 400.0f, atk);
@@ -74,7 +80,7 @@ namespace omg::dsp
             for (auto& ch : chans)
             {
                 ch.env.setTimes (attackMs, baseReleaseMs);
-                ch.sc.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, juce::jlimit (20.0f, 400.0f, p.scHpf), 0.707f);
+                ch.sc.set (BiquadCoeffs::highPass (sampleRate, juce::jlimit (20.0f, 400.0f, p.scHpf), 0.707));
             }
 
             rmsCoef = (float) std::exp (-1.0 / (0.012 * sampleRate));
@@ -92,7 +98,7 @@ namespace omg::dsp
             const int numCh = juce::jmin (2, buffer.getNumChannels());
             const int n = buffer.getNumSamples();
             const float wet = pct (p.mix);
-            const float ratio = juce::jmax (1.0f, p.ratio);
+            const float ratio = juce::jmax (1.0f, p.ratio * ratioScale);
             float worstGr = 0.0f;
 
             const bool useExternal = p.externalSidechain
@@ -116,7 +122,7 @@ namespace omg::dsp
                         source = source + (sidechain->getSample (sc, i) - source) * extBlend;
                     }
 
-                    const float filtered = ch.sc.processSample (source);
+                    const float filtered = ch.sc.process (source);
 
                     if (useRms)
                     {
@@ -176,7 +182,10 @@ namespace omg::dsp
                 for (int c = 0; c < numCh; ++c)
                 {
                     const float dry = buffer.getSample (c, i);
-                    buffer.setSample (c, i, dry + (dry * g - dry) * wet);
+                    float y = dry * g;
+                    if (slam > 0.0f)
+                        y = std::tanh (y * slam) / slam * 1.15f;
+                    buffer.setSample (c, i, dry + (y - dry) * wet);
                 }
             }
 
@@ -188,7 +197,7 @@ namespace omg::dsp
     private:
         struct Channel
         {
-            juce::dsp::IIR::Filter<float> sc;
+            Biquad sc;
             EnvFollower env;
             float rms { 0.0f };
         };
@@ -200,6 +209,7 @@ namespace omg::dsp
         float attackMs { 12.0f }, baseReleaseMs { 140.0f }, appliedReleaseMs { 140.0f };
         float autoFast { 0.0f }, autoSlow { 0.0f }, autoFastCoef { 0.99f }, autoSlowCoef { 0.999f };
         bool useRms { false };
+        float ratioScale { 1.0f }, slam { 0.0f };
         std::atomic<float> reduction { 0.0f };
     };
 }

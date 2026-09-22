@@ -17,13 +17,29 @@ namespace omg::ui
         // the control row below the display exposes the type of whichever band is
         // selected, so every band's type parameter is reachable from here
         for (int b = 0; b < kNumEqBands; ++b)
+        {
             ControlRegistry::note (eqId (b, "Type"));
+            ControlRegistry::note (eqId (b, "Slope"));
+        }
 
         graph.onBandSelected = [this] (int band) { buildRowForBand (band); };
         buildRowForBand (graph.getSelectedBand());
+        startTimerHz (8);
     }
 
-    EqPanel::~EqPanel() = default;
+    EqPanel::~EqPanel() { stopTimer(); }
+
+    /** A pass band has a slope and no gain to make dynamic; every other shape
+        is the other way round. The row shows whichever applies. */
+    void EqPanel::timerCallback()
+    {
+        if (slope == nullptr || dynamic == nullptr || currentBand < 0) return;
+        int t = 2;
+        if (auto* v = apvts.getRawParameterValue (eqId (currentBand, "Type"))) t = (int) v->load();
+        const bool pass = t == EqHighPass || t == EqLowPass;
+        slope->setVisible (pass);
+        dynamic->setVisible (! pass);
+    }
 
     void EqPanel::buildRowForBand (int band)
     {
@@ -44,6 +60,8 @@ namespace omg::ui
         dynamic->setLegend ("DYNAMIC");
         dynamic->setCompact (true);
 
+        slope = std::make_unique<OmgChoiceButton> (apvts, eqId (band, "Slope"));
+
         bandCaption.setText ("BAND  " + eqBandNames()[band]);
 
         addAndMakeVisible (*freq);
@@ -51,7 +69,9 @@ namespace omg::ui
         addAndMakeVisible (*q);
         addAndMakeVisible (*type);
         addAndMakeVisible (*dynamic);
+        addChildComponent (*slope);
 
+        timerCallback();
         resized();
     }
 
@@ -83,5 +103,6 @@ namespace omg::ui
         type->setBounds (right.removeFromTop (juce::jmin (36, right.getHeight())));
         right.removeFromTop (metric::space1);
         dynamic->setBounds (right.removeFromTop (juce::jmin (24, right.getHeight())));
+        slope->setBounds (dynamic->getBounds());
     }
 }

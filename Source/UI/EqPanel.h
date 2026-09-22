@@ -13,7 +13,8 @@ namespace omg::ui
         band is selected. Selecting a node rebuilds the row against that band's
         real parameters, so the knobs are never a copy of the band's values.
     */
-    class EqPanel : public OmgPanel
+    class EqPanel : public OmgPanel,
+                    private juce::Timer
     {
     public:
         EqPanel (OmgnedProcessor& processorToUse, juce::AudioProcessorValueTreeState& state);
@@ -23,13 +24,14 @@ namespace omg::ui
 
     private:
         void buildRowForBand (int band);
+        void timerCallback() override;
 
         juce::AudioProcessorValueTreeState& apvts;
         EqGraphComponent graph;
         OmgButton enableButton;
 
         std::unique_ptr<OmgKnob> freq, gain, q;
-        std::unique_ptr<OmgChoiceButton> type;
+        std::unique_ptr<OmgChoiceButton> type, slope;
         std::unique_ptr<OmgButton> dynamic;
         OmgCaption bandCaption { "" };
 

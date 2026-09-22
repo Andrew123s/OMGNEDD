@@ -98,7 +98,7 @@ namespace omg::ui
             addAndMakeVisible (enable);
             setHeaderRight (&enable);
 
-            static const char* legends[] = { "FREQ", "THRESHOLD", "AMOUNT", "RANGE", "ATTACK", "RELEASE" };
+            static const char* legends[] = { "FREQ", "THRESH", "AMOUNT", "RANGE", "ATTACK", "RELEASE" };
             int n = 0;
             for (auto id : { pid::deFreq, pid::deThresh, pid::deAmount,
                              pid::deRange, pid::deAttack, pid::deRelease })

@@ -31,7 +31,6 @@ namespace omg::ui
             buildSaturation();
             buildUnderwater();
             buildFilterMotion();
-            buildPitchModulation();
             buildTransient();
             buildMultiband();
             buildSidechain();

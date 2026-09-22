@@ -1,10 +1,13 @@
 #pragma once
 #include "Utils.h"
+#include "Filters.h"
 
 namespace omg::dsp
 {
-    /** Split-band de-esser. The sibilant band is separated, measured and pulled
-        down; LISTEN monitors that band on its own so the frequency can be aimed.
+    /** Split-band de-esser. A Linkwitz-Riley crossover at three quarters of
+        FREQ splits the vocal; the part above it is measured and pulled down as
+        a whole, which is where an S actually lives. LISTEN monitors that band
+        on its own so the frequency can be aimed.
     */
     class DeEsser
     {
@@ -21,16 +24,16 @@ namespace omg::dsp
             sampleRate = spec.sampleRate;
             for (auto& ch : chans)
             {
-                ch.band.prepare (spec);
-                ch.detect.prepare (spec);
+                ch.band.reset(); ch.detect.reset();
                 ch.env.prepare (spec.sampleRate);
+                ch.grSmooth.setTime (spec.sampleRate, 0.002);
             }
             reduction.store (0.0f);
         }
 
         void reset()
         {
-            for (auto& ch : chans) { ch.band.reset(); ch.detect.reset(); ch.env.env = 0.0f; }
+            for (auto& ch : chans) { ch.band.reset(); ch.detect.reset(); ch.split.reset(); ch.env.env = 0.0f; ch.grSmooth.reset(); }
             reduction.store (0.0f);
         }
 
@@ -42,8 +45,9 @@ namespace omg::dsp
 
             for (auto& ch : chans)
             {
-                ch.band.coefficients   = juce::dsp::IIR::Coefficients<float>::makeBandPass (sampleRate, f, q);
-                ch.detect.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, f * 0.8f, 0.707f);
+                ch.band.set   (BiquadCoeffs::bandPass (sampleRate, f, q));
+                ch.detect.set (BiquadCoeffs::highPass (sampleRate, f * 0.8f, 0.707));
+                ch.split.design (sampleRate, f * 0.75);
                 ch.env.setTimes (p.attack, p.release);
             }
         }
@@ -65,23 +69,21 @@ namespace omg::dsp
                 for (int i = 0; i < n; ++i)
                 {
                     const float dry = d[i];
-                    const float band = ch.band.processSample (dry);
-                    const float key  = ch.detect.processSample (dry);
+                    float low, high;
+                    ch.split.process (dry, low, high);
+                    const float key  = ch.detect.process (dry);
+                    juce::ignoreUnused (ch.band);
                     const float envDb = gainToDb (ch.env.process (std::abs (key)));
 
                     const float over = juce::jmax (0.0f, envDb - p.threshold);
-                    const float grDb = -juce::jmin (p.range, over * amount * 1.6f);
+                    const float grDb = ch.grSmooth.process (-juce::jmin (p.range, over * amount * 2.5f));
                     worst = juce::jmax (worst, -grDb);
 
-                    if (p.listen)
-                    {
-                        d[i] = band;
-                    }
-                    else
-                    {
-                        // subtract the part of the band we are reducing
-                        d[i] = dry + band * (dbToGain (grDb) - 1.0f);
-                    }
+                    // split band: everything above the crossover comes down
+                    // together, which is where sibilance actually lives. A
+                    // narrow band around the frequency leaves the top of an S
+                    // untouched, and that is what the first version did.
+                    d[i] = p.listen ? high : low + high * dbToGain (grDb);
                 }
             }
 
@@ -93,7 +95,9 @@ namespace omg::dsp
     private:
         struct Channel
         {
-            juce::dsp::IIR::Filter<float> band, detect;
+            Biquad band, detect;
+            Lr4Crossover split;
+            OnePole grSmooth;
             EnvFollower env;
         };
 

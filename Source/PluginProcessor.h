@@ -6,6 +6,8 @@
 #include "StateManager.h"
 #include "Presets/PresetManager.h"
 #include "DSP/Utils.h"
+#include "DSP/Filters.h"
+#include "DSP/Tempo.h"
 #include "DSP/UnderwaterEngine.h"
 #include "DSP/DistortionEngine.h"
 #include "DSP/SaturationEngine.h"
@@ -18,6 +20,8 @@
 #include "DSP/ModulationEngine.h"
 #include "DSP/MultibandDrive.h"
 #include "DSP/TransientShaper.h"
+#include "DSP/FilterFx.h"
+#include "DSP/SpaceEngine.h"
 #include "Randomizer.h"
 
 
@@ -31,7 +35,13 @@ public:
     void releaseResources() override;
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     using juce::AudioProcessor::processBlock;
+    using juce::AudioProcessor::processBlockBypassed;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    /** The host's own bypass. The plugin reports latency, so bypassed audio
+        is delayed by exactly that much: toggling bypass never shifts the
+        vocal in time against the rest of the mix. */
+    void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
@@ -40,7 +50,9 @@ public:
     bool acceptsMidi() const override  { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+
+    /** The reverb and delay ring on after the input stops. */
+    double getTailLengthSeconds() const override { return 8.0; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -64,32 +76,40 @@ public:
     float getDeEsserReductionDb()   const { return deEsser.getReductionDb(); }
     float getLimiterReductionDb()   const { return outputStage.getLimiterReductionDb(); }
 
-    /** Peak drive level measured going into the character engine, in dB, for
-        the DRIVE meter. */
+    /** Peak level measured going into the character engine, in dB. */
     float getDriveDb() const { return driveMeterDb.load(); }
 
-    /** True once the host has actually connected something to the sidechain
-        bus, so the panel can show that the external detector has a source. */
     bool isSidechainConnected() const { return sidechainConnected.load(); }
 
-    /** Summed EQ magnitude at one frequency, including the macro offsets the
-        processor actually applied on the last block. Used to draw the curve. */
+    /** Summed EQ magnitude at one frequency; safe from the message thread. */
     float getEqResponseDb (float hz) { return eq.getResponseDb (hz); }
 
-    /** Editor size, persisted with the session. */
+    /** The tempo the synced controls are following, for the panel. */
+    double getCurrentBpm() const { return currentBpm.load(); }
+
     void setEditorSize (int w, int h);
     juce::Rectangle<int> getSavedEditorSize() const;
 
+    /** For the verification target: lets a test supply the transport a host
+        would, so tempo sync can be measured without a host. */
+    void setTransportOverride (const omg::dsp::TransportInfo& t) { transportOverride = t; hasTransportOverride = true; }
+
 private:
-    void pullParameters();
-    void runCharacterChain (juce::AudioBuffer<float>& buffer, int engineMode, int osIndex);
+    void pullParameters (const omg::dsp::TransportInfo&);
+    void runCharacterChain (juce::AudioBuffer<float>& buffer, int osIndex);
+    void applyEngineRate (int osIndex);
+    void processEngine (int engine, juce::AudioBuffer<float>& b);
+    void resetEngine (int engine);
+    omg::dsp::TransportInfo readTransport();
 
     omg::dsp::UnderwaterEngine  underwater;
-    omg::dsp::ModulationEngine  modulation;
-    omg::dsp::MultibandDrive    multiband;
-    omg::dsp::TransientShaper   transient;
     omg::dsp::DistortionEngine  distortion;
     omg::dsp::SaturationEngine  saturation;
+    omg::dsp::MultibandDrive    multiband;
+    omg::dsp::ModulationEngine  modulation;
+    omg::dsp::TransientShaper   transient;
+    omg::dsp::FilterFx          filterFx;
+    omg::dsp::SpaceEngine       space;
     omg::dsp::EqSection         eq;
     omg::dsp::CompressorSection compressor;
     omg::dsp::DeEsser           deEsser;
@@ -97,20 +117,38 @@ private:
 
     std::array<std::unique_ptr<juce::dsp::Oversampling<float>>, 3> oversamplers;
 
-    juce::AudioBuffer<float> dryBuffer;
+    juce::AudioBuffer<float> dryBuffer, osScratch, xfadeScratch, sidechainCopy, sideStash;
 
-    /** Preallocated at the largest rate the oversampler can ask for, so the
-        audio thread never allocates. */
-    juce::AudioBuffer<float> osScratch;
-    juce::AudioBuffer<float> sidechainCopy;
+    /** The oversampler delays the engine path. Anything mixed back against it
+        (the global dry signal, and the side channel in M/S mode) is delayed by
+        the same amount, or partial MIX settings comb-filter. */
+    std::array<omg::dsp::DelayLine, 2> dryAlign, bypassAlign;
+    omg::dsp::DelayLine sideAlign;
+
+    /** Passes the main bus through, delayed by the reported latency. */
+    void passThroughAligned (juce::AudioBuffer<float>& work);
 
     omg::dsp::Smooth inGainSmooth, outGainSmooth, mixSmooth, dryLevelSmooth, wetLevelSmooth;
     std::atomic<float> driveMeterDb { -100.0f };
     std::atomic<bool>  sidechainConnected { false };
+    std::atomic<double> currentBpm { 120.0 };
 
     double currentSampleRate { 44100.0 };
     int    currentBlockSize { 512 };
-    int    lastOversamplingIndex { -1 };
+    int    lastOsIndex { -1 };
+    float  engineLatency { 0.0f };        // exact, fractional; the host gets it rounded
+
+    // engine switching: both run for a short equal-power crossfade
+    int currentEngine { -1 }, previousEngine { -1 };
+    int xfadeLeft { 0 }, xfadeTotal { 1 };
+
+    // how much of the underwater wash is live, following engine switches
+    float underwaterWeight { 0.0f };
+    float washAmount { 0.0f };
+    bool  midSideEngine { false };
+
+    omg::dsp::TransportInfo transportOverride;
+    bool hasTransportOverride { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OmgnedProcessor)
 };

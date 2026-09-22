@@ -17,16 +17,20 @@ int main()
     auto setP = [&p] (const char* id, float v)
     { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
 
-    struct Case { const char* name; int engine; int os; int mod; int mb; };
+    // underwater at its default WATER of 50 always includes the wash
+    // (reverb and delay), so its figures are the engine plus SPACE
+    struct Case { const char* name; int engine; int os; int mod; int mb; int fx; int space; };
     const Case cases[] = {
-        { "underwater, no oversampling", 0, 0, 0, 0 },
-        { "underwater, 2x",              0, 1, 0, 0 },
-        { "distortion, 2x",              1, 1, 0, 0 },
-        { "distortion, 4x",              1, 2, 0, 0 },
-        { "distortion, 8x",              1, 3, 0, 0 },
-        { "saturation, 2x",              2, 1, 0, 0 },
-        { "distortion, 4x + mod + mb",   1, 2, 1, 1 },
-        { "everything on, 8x",           1, 3, 1, 1 },
+        { "underwater + wash, no OS",    0, 0, 0, 0, 0, 0 },
+        { "underwater + wash, 2x",       0, 1, 0, 0, 0, 0 },
+        { "distortion, 2x",              1, 1, 0, 0, 0, 0 },
+        { "distortion, 4x",              1, 2, 0, 0, 0, 0 },
+        { "distortion, 8x",              1, 3, 0, 0, 0, 0 },
+        { "saturation, 2x",              2, 1, 0, 0, 0, 0 },
+        { "saturation, 2x + wobble",     2, 1, 0, 0, 1, 0 },
+        { "saturation, 2x + space",      2, 1, 0, 0, 0, 1 },
+        { "distortion, 4x + mod + mb",   1, 2, 1, 1, 0, 0 },
+        { "everything on, 8x",           0, 3, 1, 1, 1, 1 },
     };
 
     for (const auto& c : cases)
@@ -40,6 +44,11 @@ int main()
         setP (omg::pid::character, 80.0f);
         setP (omg::pid::trOn, (float) c.mod);
         setP (omg::pid::trAttack, c.mod ? 50.0f : 0.0f);
+        setP (omg::pid::pitMix, c.mod ? 40.0f : 0.0f);
+        setP (omg::pid::pitShift, c.mod ? -12.0f : 0.0f);
+        setP (omg::pid::fxOn, (float) c.fx);
+        setP (omg::pid::revOn, (float) c.space);
+        setP (omg::pid::dlyOn, (float) c.space);
 
         for (int n = 0; n < 40; ++n) { for (int ch=0; ch<2; ++ch) for (int i=0;i<block;++i) b.setSample(ch,i,(r.nextFloat()*2-1)*0.3f); p.processBlock (b, m); }
 
