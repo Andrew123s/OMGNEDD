@@ -6,12 +6,25 @@
     metering and analyser move, and the editor lays out at every supported size.
 */
 #include <juce_audio_utils/juce_audio_utils.h>
+#include <iostream>
+#include <set>
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "UI/OmgKnob.h"
 
 namespace
 {
+    /** JUCE's default logger writes to the platform debugger on Windows, which
+        means a redirected run captures nothing. This one always reaches stdout,
+        so the same command produces the same report on every platform. */
+    struct StdoutLogger : public juce::Logger
+    {
+        void logMessage (const juce::String& message) override
+        {
+            std::cout << message << std::endl;
+        }
+    };
+
     int failures = 0;
 
     void check (bool condition, const juce::String& what)
@@ -103,6 +116,77 @@ namespace
         return nullptr;
     }
 
+    /** The fraction of the image that is not fully transparent. A render that
+        never happened is uniformly transparent, which is how a blank panel gets
+        past a check that only looks at the image's dimensions. */
+    float paintedCoverage (const juce::Image& image)
+    {
+        const juce::Image::BitmapData data (image, juce::Image::BitmapData::readOnly);
+        juce::int64 opaque = 0, total = 0;
+
+        for (int y = 0; y < image.getHeight(); y += 2)
+            for (int x = 0; x < image.getWidth(); x += 2)
+            {
+                ++total;
+                if (data.getPixelColour (x, y).getAlpha() > 8)
+                    ++opaque;
+            }
+
+        return total > 0 ? (float) opaque / (float) total : 0.0f;
+    }
+
+    /** How many distinct colours the render contains, quantised. A panel filled
+        with one flat colour is not a panel that drew its controls. */
+    int distinctColours (const juce::Image& image)
+    {
+        const juce::Image::BitmapData data (image, juce::Image::BitmapData::readOnly);
+        std::set<juce::uint32> seen;
+
+        for (int y = 0; y < image.getHeight(); y += 3)
+            for (int x = 0; x < image.getWidth(); x += 3)
+            {
+                const auto c = data.getPixelColour (x, y);
+                seen.insert (((juce::uint32) (c.getRed()   >> 3) << 10)
+                           | ((juce::uint32) (c.getGreen() >> 3) << 5)
+                           |  (juce::uint32) (c.getBlue()  >> 3));
+
+                if (seen.size() > 4096) return (int) seen.size();
+            }
+
+        return (int) seen.size();
+    }
+
+    /** A CPU-backed image of a known layout.
+
+        juce::Image's default constructor asks for the platform's native image
+        type, which on Windows under JUCE 8 is Direct2D backed; painting into
+        one off-screen and then reading it back through BitmapData returns
+        nothing. A software image behaves identically on every platform, which
+        is what a verification render needs. */
+    juce::Image makeRenderTarget (int width, int height)
+    {
+        return juce::Image (juce::Image::ARGB, width, height, true, juce::SoftwareImageType());
+    }
+
+    /** Paints a component into a fresh software image at its current size. */
+    juce::Image renderComponent (juce::Component& c)
+    {
+        auto image = makeRenderTarget (c.getWidth(), c.getHeight());
+        juce::Graphics g (image);
+        c.paintEntireComponent (g, true);
+        return image;
+    }
+
+    void writePng (const juce::Image& image, const juce::String& name)
+    {
+        juce::File out (juce::File::getCurrentWorkingDirectory().getChildFile (name));
+        out.deleteFile();
+        juce::FileOutputStream stream (out);
+        juce::PNGImageFormat png;
+        png.writeImageToStream (image, stream);
+        juce::Logger::writeToLog ("  wrote " + out.getFullPathName());
+    }
+
     int countComponents (juce::Component& root)
     {
         int n = 1;
@@ -115,6 +199,10 @@ namespace
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    StdoutLogger logger;
+    juce::Logger::setCurrentLogger (&logger);
+
     juce::Logger::writeToLog ("OMGNEDD verification");
 
     OmgnedProcessor processor;
@@ -639,6 +727,13 @@ int main()
     std::unique_ptr<juce::AudioProcessorEditor> editor (processor.createEditor());
     check (editor != nullptr, "the editor is created");
 
+    // an editor that has never been added to a desktop window is not visible,
+    // and an invisible component paints nothing into an image. Without this the
+    // paint checks below pass against a blank render, which is exactly what
+    // they exist to catch.
+    if (editor != nullptr)
+        editor->setVisible (true);
+
     if (editor != nullptr)
     {
         const int sizes[][2] = { { 900, 600 }, { 1200, 720 }, { 1500, 900 }, { 1800, 1080 } };
@@ -646,53 +741,33 @@ int main()
         for (const auto& s : sizes)
         {
             editor->setSize (s[0], s[1]);
-            juce::Image image (juce::Image::ARGB, s[0], s[1], true);
-            juce::Graphics g (image);
-            editor->paintEntireComponent (g, true);
-            check (image.getWidth() == s[0], "lays out and paints at " + juce::String (s[0]) + " x " + juce::String (s[1]));
+            const auto image = renderComponent (*editor);
+
+            const auto coverage = paintedCoverage (image);
+            check (image.getWidth() == s[0] && coverage > 0.90f,
+                   "lays out and paints at " + juce::String (s[0]) + " x " + juce::String (s[1])
+                     + " (" + juce::String (juce::roundToInt (coverage * 100.0f)) + "% covered)");
+
+            const auto colours = distinctColours (image);
+            check (colours >= 24,
+                   "the panel at " + juce::String (s[0]) + " x " + juce::String (s[1])
+                     + " draws real content, not a flat fill (" + juce::String (colours) + " distinct colours)");
         }
 
         // render the panel to a file so the layout can be inspected
         editor->setSize (1200, 720);
-        {
-            juce::Image shot (juce::Image::ARGB, 1200, 720, true);
-            juce::Graphics g (shot);
-            editor->paintEntireComponent (g, true);
-            juce::File out ("omgnedd-ui.png");
-            out.deleteFile();
-            juce::FileOutputStream stream (out);
-            juce::PNGImageFormat png;
-            png.writeImageToStream (shot, stream);
-            juce::Logger::writeToLog ("  wrote " + out.getFullPathName());
-        }
+        writePng (renderComponent (*editor), "omgnedd-ui.png");
 
         editor->setSize (900, 600);
-        {
-            juce::Image shot (juce::Image::ARGB, 900, 600, true);
-            juce::Graphics g (shot);
-            editor->paintEntireComponent (g, true);
-            juce::File out ("omgnedd-ui-small.png");
-            out.deleteFile();
-            juce::FileOutputStream stream (out);
-            juce::PNGImageFormat png;
-            png.writeImageToStream (shot, stream);
-            juce::Logger::writeToLog ("  wrote " + out.getFullPathName());
-        }
+        writePng (renderComponent (*editor), "omgnedd-ui-small.png");
+
         editor->setSize (1200, 720);
 
         if (auto* adv = findByID (*editor, "adv"))
         {
             if (adv->onClick != nullptr) adv->onClick();
             editor->resized();
-            juce::Image shot (juce::Image::ARGB, 1200, 720, true);
-            juce::Graphics g (shot);
-            editor->paintEntireComponent (g, true);
-            juce::File out ("omgnedd-advanced.png");
-            out.deleteFile();
-            juce::FileOutputStream stream (out);
-            juce::PNGImageFormat png;
-            png.writeImageToStream (shot, stream);
-            juce::Logger::writeToLog ("  wrote " + out.getFullPathName());
+            writePng (renderComponent (*editor), "omgnedd-advanced.png");
             if (adv->onClick != nullptr) adv->onClick();
             editor->resized();
         }
@@ -731,5 +806,7 @@ int main()
 
     juce::Logger::writeToLog (failures == 0 ? "\nALL CHECKS PASSED"
                                             : "\n" + juce::String (failures) + " CHECK(S) FAILED");
+
+    juce::Logger::setCurrentLogger (nullptr);
     return failures == 0 ? 0 : 1;
 }

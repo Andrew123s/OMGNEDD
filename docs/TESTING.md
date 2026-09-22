@@ -103,7 +103,10 @@ build failure, not something a user discovers.
 ### The editor
 
 * It constructs, lays out and paints at 900×600, 1200×720, 1500×900 and
-  1800×1080.
+  1800×1080 — and the render is checked for *content*, not just dimensions:
+  at least 90 % of the image must be non-transparent and it must contain at
+  least 24 distinct colours. Both platforms report the same figures (100 %
+  coverage, 185 to 218 colours), so the panel draws identically on each.
 * Every control on the panel drives a real APVTS parameter.
 * Every parameter is reachable from the interface.
 
@@ -199,9 +202,25 @@ Stated plainly rather than left to be discovered:
 * **No listening test in the build.** "Musically useful" is not something a
   build can assert. The suite checks that every preset is *safe*; whether it is
   *good* is a human question.
-* **The editor is painted, not driven.** Layout and painting are checked at four
-  sizes and the control-to-parameter binding is checked exhaustively, but mouse
-  gestures, drag behaviour and keyboard focus order are not simulated.
-* **Windows and macOS are not built in CI here.** The suite is portable and the
-  code has no platform-specific paths beyond JUCE's own, but the figures and the
-  runs in this document are from Linux.
+* **The editor is painted, not driven.** Painting is now checked for real
+  content at four sizes and the control-to-parameter binding is checked
+  exhaustively, but mouse gestures, drag behaviour and keyboard focus order are
+  not simulated.
+* **macOS is not built here.** Windows and Linux are both built and run; macOS
+  is not, though the code has no platform-specific paths beyond JUCE's own.
+
+## Two platform notes, both learned the hard way
+
+**Render into a software image.** `juce::Image (format, w, h, clear)` asks for
+the platform's native image type. Under JUCE 8 on Windows that is Direct2D
+backed, and painting a component into one off-screen then reading it back
+through `BitmapData` yields nothing at all — every pixel transparent. The suite
+therefore builds its render targets with `SoftwareImageType`, which behaves the
+same on every platform. This only surfaced because the paint check looks at
+pixels; a check that asserted image dimensions passed happily against a
+completely blank panel, which is the reason the content check exists.
+
+**Log to stdout explicitly.** JUCE's default logger writes to the platform
+debugger on Windows, so a redirected run captured an empty file while still
+exiting 0. The suite installs its own `Logger` that writes to `std::cout`, so
+the same command produces the same report everywhere.
