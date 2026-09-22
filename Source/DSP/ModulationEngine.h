@@ -294,14 +294,16 @@ namespace omg::dsp
             costs a fraction of a Lagrange read per sample. */
         float readInterpolated (Channel& ch, float delaySamples) const noexcept
         {
-            delaySamples = juce::jlimit (1.0f, (float) maxDelaySamples - 2.0f, delaySamples);
+            if (! (delaySamples >= 1.0f)) delaySamples = 1.0f;          // NaN included
+            delaySamples = std::min (delaySamples, (float) maxDelaySamples - 2.0f);
 
-            float pos = (float) ch.writePos - delaySamples;
-            while (pos < 0.0f) pos += (float) maxDelaySamples;
-
-            const int i0 = (int) pos;
-            const float frac = pos - (float) i0;
-            const int i1 = (i0 + 1) % maxDelaySamples;
+            // wrap as an integer: wrapping a float position can round a value
+            // just below zero up to exactly maxDelaySamples, one past the end
+            const int whole = (int) delaySamples;
+            const float frac = delaySamples - (float) whole;
+            int i0 = ch.writePos - whole;
+            if (i0 < 0) i0 += maxDelaySamples;
+            const int i1 = i0 == 0 ? maxDelaySamples - 1 : i0 - 1;
 
             return ch.line[(size_t) i0] + frac * (ch.line[(size_t) i1] - ch.line[(size_t) i0]);
         }

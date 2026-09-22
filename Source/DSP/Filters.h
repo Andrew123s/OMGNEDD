@@ -308,11 +308,15 @@ namespace omg::dsp
             if (! (d >= 0.0f)) d = 0.0f;
             if (size < 4 || buf.empty()) return 0.0f;
             d = std::min (d, (float) (size - 2));
-            float pos = (float) (w - 1) - d;
-            while (pos < 0.0f) pos += (float) size;
-            const int i0 = (int) pos;
-            const int i1 = i0 + 1 >= size ? 0 : i0 + 1;
-            const float fr = pos - (float) i0;
+
+            // split into whole and fractional samples and wrap the index as an
+            // integer. Wrapping a float position instead can round a position
+            // just below zero up to exactly `size`, one past the end.
+            const int whole = (int) d;
+            const float fr = d - (float) whole;
+            int i0 = w - 1 - whole;                     // `whole` samples back
+            if (i0 < 0) i0 += size;
+            const int i1 = i0 == 0 ? size - 1 : i0 - 1; // one sample further back
             return buf[(size_t) i0] + fr * (buf[(size_t) i1] - buf[(size_t) i0]);
         }
     };

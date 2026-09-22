@@ -95,8 +95,11 @@ coefficients can be redesigned per block without allocating:
   de-esser.
 * `DelayLine`, fractional with linear interpolation, sized once. A read with a
   non-finite or negative delay is treated as zero delay and a read before
-  allocation returns silence, so a bad modulation value can never index
-  outside the buffer.
+  allocation returns silence, and the read index is wrapped as an integer.
+  An earlier version wrapped a float position, which could round a position a
+  hair below zero up to exactly the buffer length and read one sample past the
+  end. AddressSanitizer found it, and it is the most likely cause of an
+  occasional runaway reverb tail seen in earlier test runs.
 * `AutoGain`, a slow level follower that brings a processed signal back to the
   level of the signal that fed it. The engines use it so that DEPTH, DRIVE and
   the algorithm change the character, not the loudness, and an A/B is not won

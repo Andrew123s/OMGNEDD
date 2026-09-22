@@ -293,6 +293,27 @@ The build instructions for each of these steps are in [BUILD.md](BUILD.md).
 
 ---
 
+## Sanitizers
+
+The suite is also built with AddressSanitizer and UndefinedBehaviorSanitizer
+and run in full:
+
+```bash
+cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-omit-frame-pointer"
+cmake --build build-asan --target OMGNEDD_Tests
+ASAN_OPTIONS=detect_leaks=0 xvfb-run -a ./build-asan/OMGNEDD_Tests_artefacts/RelWithDebInfo/OMGNEDD_Tests
+```
+
+Leak detection is off because the X11 and font libraries hold allocations for
+the life of the process. This run found a real bug: a delay line read that
+could land one sample past the end of its buffer (see
+[DSP.md](DSP.md#filtersh-the-shared-building-blocks)). In the normal suite
+it most likely showed up only as an occasional runaway reverb tail, depending
+on what happened to sit in memory after the buffer.
+
+---
+
 ## What is not covered
 
 Stated plainly rather than left to be discovered:
